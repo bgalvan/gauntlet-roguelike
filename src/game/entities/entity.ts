@@ -23,6 +23,24 @@ export abstract class Entity {
   maxHp: number;
   alive = true;
 
+  /**
+   * Knockback velocity, in world units per second. Decays exponentially.
+   *
+   * This is simulation state, not a visual effect — it moves bodies, so it is
+   * deterministic and checksummed. Being shoved is most of what makes a hit
+   * feel like it connected.
+   */
+  knockX = 0;
+  knockY = 0;
+
+  /**
+   * Ticks this body is stunned. Staggered entities take knockback but do not
+   * act — the local, deterministic version of hit-stop. A *global* freeze
+   * would feel better still, but it would have to be identical on every peer
+   * and is a poor fit for lockstep, so impact is sold per-body instead.
+   */
+  staggerTicks = 0;
+
   constructor(id: number, x: number, y: number, radius: number, maxHp: number) {
     this.id = id;
     this.x = x;
@@ -54,6 +72,38 @@ export abstract class Entity {
     }
   }
 
+  /** Add an impulse. `dirX/dirY` should be a unit vector. */
+  applyKnockback(dirX: number, dirY: number, speed: number): void {
+    this.knockX += dirX * speed;
+    this.knockY += dirY * speed;
+  }
+
+  stagger(ticks: number): void {
+    if (ticks > this.staggerTicks) this.staggerTicks = ticks;
+  }
+
+  /**
+   * Integrate knockback and tick down stagger. Called for every body once per
+   * step, after the entity's own update.
+   */
+  stepPhysics(dt: number): void {
+    if (this.staggerTicks > 0) this.staggerTicks--;
+
+    if (this.knockX === 0 && this.knockY === 0) return;
+
+    this.x += this.knockX * dt;
+    this.y += this.knockY * dt;
+
+    // Exponential decay with a cutoff, so knockback settles in a bounded
+    // number of ticks instead of asymptotically drifting forever — an
+    // never-quite-zero velocity is a float-drift source.
+    const decay = 0.86;
+    this.knockX *= decay;
+    this.knockY *= decay;
+    if (Math.abs(this.knockX) < 1) this.knockX = 0;
+    if (Math.abs(this.knockY) < 1) this.knockY = 0;
+  }
+
   /**
    * Contribute every field the simulation reads to the checksum. Subclasses
    * must call super and then add their own — a field that affects future
@@ -63,7 +113,14 @@ export abstract class Entity {
    * `prevX`/`prevY` are excluded on purpose: they are render-only.
    */
   writeChecksum(h: Hasher): void {
-    h.int(this.id).float(this.x).float(this.y).float(this.hp).bool(this.alive);
+    h.int(this.id)
+      .float(this.x)
+      .float(this.y)
+      .float(this.hp)
+      .bool(this.alive)
+      .float(this.knockX)
+      .float(this.knockY)
+      .int(this.staggerTicks);
   }
 }
 

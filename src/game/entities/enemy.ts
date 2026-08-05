@@ -54,6 +54,14 @@ export class Enemy extends Entity {
     if (!this.alive) return;
     if (this.cooldownTicks > 0) this.cooldownTicks--;
 
+    // Staggered: shoved around but unable to act. This is what sells a hit as
+    // an impact, and what makes a payoff ability a party opening rather than
+    // just damage. An interrupted wind-up is cancelled outright.
+    if (this.staggerTicks > 0) {
+      this.windupTicks = 0;
+      return;
+    }
+
     // Mid-swing: hold still and commit. Movement during a telegraph would
     // make the telegraph meaningless.
     if (this.windupTicks > 0) {
@@ -144,7 +152,7 @@ export class Enemy extends Entity {
       const reach = ENEMY.ATTACK_RANGE + p.radius;
       // Stepping out of the telegraph is the counterplay. If they moved, the
       // swing whiffs.
-      if (dx * dx + dy * dy <= reach * reach) p.takeDamage(ENEMY.DAMAGE);
+      if (dx * dx + dy * dy <= reach * reach) p.takeDamage(ENEMY.DAMAGE, this.x, this.y);
       return;
     }
   }

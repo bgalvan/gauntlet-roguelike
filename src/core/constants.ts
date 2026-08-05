@@ -35,24 +35,53 @@ export const ROOM = {
 export const PARTY_SIZE = 4;
 
 export const COLLISION = {
-  /** Relaxation passes per tick. One pass leaves residual overlap in a pile;
-   *  two is enough at these entity counts and stays cheap. */
-  ITERATIONS: 2,
+  /**
+   * Relaxation passes per tick. Two was enough before knockback existed;
+   * payoff abilities now shove whole crowds at 420+ units/second and a pile
+   * against a wall needs more passes to unwind. Cheap at ~26 bodies.
+   */
+  ITERATIONS: 4,
   /** Fraction of the overlap resolved per pass. Below 1 so bodies settle
    *  instead of jittering against each other. */
-  STIFFNESS: 0.6,
+  STIFFNESS: 0.7,
 } as const;
 
+/**
+ * Shared player geometry. Everything else that used to live here — HP, speed,
+ * attack stats — is per-class now and lives in src/game/classes.ts. One
+ * source of truth; §0 says contradictions are worse than gaps.
+ */
 export const PLAYER = {
   RADIUS: 16,
-  /** World units per second. */
-  MOVE_SPEED: 260,
-  MAX_HP: 100,
-  /** Auto-attack reach, measured centre to centre. */
-  ATTACK_RANGE: 190,
-  /** Seconds between auto-attacks. */
-  ATTACK_INTERVAL: 0.45,
-  ATTACK_DAMAGE: 7,
+} as const;
+
+/**
+ * Shared combat feel. These are the numbers that decide whether a hit reads
+ * as an impact or as a number going down.
+ */
+export const COMBAT = {
+  /** Knockback impulse from a basic attack, world units per second. */
+  BASIC_KNOCKBACK: 190,
+  PROJECTILE_KNOCKBACK: 150,
+  /** Ticks an enemy is stunned by a normal hit. The local stand-in for
+   *  hit-stop — see the note in Entity. */
+  HIT_STAGGER_TICKS: 5,
+  /** A heavier stagger for payoff abilities, so slot 3 reads as an event. */
+  HEAVY_STAGGER_TICKS: 34,
+
+  PROJECTILE_RADIUS: 7,
+  /** Safety net so a stray shot cannot live forever. */
+  PROJECTILE_LIFE_TICKS: 180,
+  /** Pool size. Four Archers at 4 shots/sec with a 3s life would peak near
+   *  50; this leaves headroom without unbounded growth (constraint #4). */
+  PROJECTILE_POOL: 96,
+
+  /** Seconds an ally shield from Valkyrie's slam lasts. */
+  SHIELD_DURATION: 4,
+  /** Fraction of incoming damage a shield absorbs. */
+  SHIELD_ABSORB: 0.5,
+  /** Fraction of damage Valkyrie's block absorbs from the facing cone. */
+  BLOCK_CONE: Math.PI / 2.4,
 } as const;
 
 /**
@@ -119,8 +148,9 @@ export const DEATH = {
   /** Any ally revives with a 3s channel. Free. */
   REVIVE_CHANNEL: 3.0,
   REVIVE_RANGE: 62,
-  /** HP a revived player stands up with. */
-  REVIVE_HP: 35,
+  /** Percent of max HP a revived player stands up with. A percentage rather
+   *  than a flat value because class HP pools differ (82–150). */
+  REVIVE_HP_PERCENT: 35,
 
   /** Stage 2 — Wraith: moves freely, cannot be hurt, one weak utility. */
   WRAITH_SPEED: 300,
@@ -169,6 +199,16 @@ export const BOT = {
   REENGAGE_HP: 0.7,
   /** How far a retreating bot wants to be from the nearest enemy. */
   RETREAT_DISTANCE: 260,
+
+  /**
+   * A hurt bot burns its escape (dash / blink) when something is this close.
+   *
+   * An absolute distance, deliberately not a fraction of attack range: the
+   * Archer's standoff is 238 and 70% of its range is 231, so a range-relative
+   * threshold could never fire — the bot was always already further away than
+   * its own escape condition required.
+   */
+  ESCAPE_DISTANCE: 150,
 } as const;
 
 /**

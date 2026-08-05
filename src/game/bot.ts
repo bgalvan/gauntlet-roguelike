@@ -3,6 +3,8 @@ import { BOT, DEATH, PLAYER, ROOM } from '../core/constants';
 import type { Rng } from '../core/rng';
 import type { InputState } from '../input/input-state';
 import { clampToUnit } from '../input/input-state';
+import { AbilityId } from './classes';
+import type { AbilityDef } from './classes';
 import type { PlayerController } from './controller';
 import { distanceSq } from './entities/entity';
 import type { Entity } from './entities/entity';
@@ -131,6 +133,7 @@ export class BotController implements PlayerController {
     // Auto-attack keeps firing while retreating (constraint #6 — attacks
     // aren't aimed), so a kiting bot is still contributing.
     const target = nearestLiving(self, enemies);
+    this.useAbilities(self, target, enemies, out);
 
     if (target) {
       const dx = target.x - self.x;
@@ -140,9 +143,12 @@ export class BotController implements PlayerController {
       if (dist > 0) {
         const towardX = dx / dist;
         const towardY = dy / dist;
+        // Standoff is per-class now: an Archer at 330 range and a Warrior at
+        // 116 want completely different spacing, and using one shared number
+        // made three of the four classes fight like the fourth.
         const standoff = this.retreating
           ? BOT.RETREAT_DISTANCE
-          : PLAYER.ATTACK_RANGE * BOT.STANDOFF;
+          : self.def.attackRange * BOT.STANDOFF;
 
         if (dist > standoff + BOT.TOLERANCE) {
           steerX += towardX;
@@ -170,6 +176,125 @@ export class BotController implements PlayerController {
     }
 
     this.applySteering(self, steerX, steerY, allies, out);
+  }
+
+  // --- abilities -----------------------------------------------------------
+
+  /**
+   * Decide which of the three slots to press this tick.
+   *
+   * Bots must exercise all twelve abilities or three of the four classes go
+   * untested — and untested is where the last two bugs lived. Conditions are
+   * pure functions of world state: no PRNG draws, so adding this cannot shift
+   * any other system's random stream.
+   *
+   * Player.tryAbilities reads `pressed` for tap abilities and `down` for held
+   * ones. Bot inputs never go through InputManager, so nothing derives edges
+   * for them — the bot sets both flags itself.
+   */
+  private useAbilities(
+    self: Player,
+    target: Entity | null,
+    enemies: readonly Entity[],
+    out: InputState,
+  ): void {
+    const payoff = self.def.abilities[2]!;
+    const payoffCost = payoff.spendsAll ? self.def.resource.max : payoff.cost;
+
+    /**
+     * Hold the resource when the room already warrants the payoff but the
+     * pool is short.
+     *
+     * Without this the signature drains the pool on cooldown and the payoff
+     * literally never fires: the Sorcerer spent mana on Blast at 67 and fell
+     * back to 35, so Deep Freeze's full pool was unreachable, and the Valkyrie
+     * bled stamina into Block so Slam never came up. Measured — both were
+     * dead code until this rule existed. It is also just correct play.
+     */
+    const savingForPayoff =
+      payoffCost > 0 &&
+      self.resource < payoffCost &&
+      this.abilityCondition(self, payoff, target, enemies);
+
+    for (let slot = 0; slot < 3; slot++) {
+      const def = self.def.abilities[slot]!;
+
+      const cost = def.spendsAll ? self.def.resource.max : def.cost;
+      if (cost > 0 && self.resource < cost) continue;
+      // Slot 2 is the only one that ever yields to the payoff; slot 1 is
+      // traversal and free, slot 3 *is* the payoff.
+      // `def.held` matters as much as `cost`: Block lists no cost but drains
+      // stamina every tick it is down, which starved Slam of its full pool.
+      if (slot === 1 && savingForPayoff && (cost > 0 || def.held)) continue;
+      if (!this.abilityCondition(self, def, target, enemies)) continue;
+
+      const button = out.ability[slot]!;
+      button.down = true;
+      button.pressed = !def.held;
+      button.value = 1;
+    }
+  }
+
+  /** Situational condition only — affordability is checked by the caller, so
+   *  that "would I want this if I could pay?" can be asked separately. */
+  private abilityCondition(
+    self: Player,
+    def: AbilityDef,
+    target: Entity | null,
+    enemies: readonly Entity[],
+  ): boolean {
+    const targetDist = target ? Math.hypot(target.x - self.x, target.y - self.y) : Infinity;
+
+    switch (def.id) {
+      // --- Slot 1: traversal ---------------------------------------------
+      case AbilityId.Charge:
+      case AbilityId.Plow:
+        // Gap closers: only worth it when there is a gap, and never while
+        // running away — charging into the swarm you are fleeing is suicide.
+        return !this.retreating && targetDist > self.def.attackRange * 1.4 && targetDist < def.distance * 1.5;
+
+      case AbilityId.Dash:
+      case AbilityId.Blink:
+        // Escapes: break contact whenever something has closed the gap. Not
+        // gated on being hurt — a dash is the ranged classes' answer to
+        // "something reached me", which is true at full health too. Absolute
+        // distance; see BOT.ESCAPE_DISTANCE for why range-relative fails.
+        return targetDist < BOT.ESCAPE_DISTANCE;
+
+      // --- Slot 2: signature ----------------------------------------------
+      case AbilityId.Whirlwind:
+        // Worth a 6s cooldown only against a group.
+        return countWithin(self.x, self.y, def.radius, enemies) >= 2;
+
+      case AbilityId.ChargedShot:
+        return target !== null && targetDist <= def.distance * 0.8;
+
+      case AbilityId.Blast:
+        // Mana is a budget, so spend it on clusters rather than singles.
+        return target !== null && countWithin(target.x, target.y, def.radius, enemies) >= 2;
+
+      case AbilityId.Block:
+        // §3.3 slot 2 is "rhythm" — the Valkyrie's is holding ground. Blocking
+        // halves movement, so only while something is actually close, and only
+        // with stamina to spare.
+        return targetDist < self.def.attackRange * 1.2 && self.resourceFraction > 0.3;
+
+      // --- Slot 3: payoff --------------------------------------------------
+      case AbilityId.Shockwave:
+      case AbilityId.Freeze:
+        // §3.3: the payoff fires 3–8 times a floor and should read as an
+        // event. Gate it on the room actually being dangerous.
+        return countWithin(self.x, self.y, def.radius, enemies) >= 4;
+
+      case AbilityId.Slam:
+        return countWithin(self.x, self.y, def.radius, enemies) >= 3;
+
+      case AbilityId.Volley:
+        return target !== null && countWithin(target.x, target.y, def.radius, enemies) >= 3;
+
+      default:
+        return false;
+    }
   }
 
   // --- Downed (§8 stage 1) -------------------------------------------------
@@ -400,6 +525,20 @@ function findById(players: readonly Player[], id: number): Player | null {
     if (players[i]!.id === id) return players[i]!;
   }
   return null;
+}
+
+/** Living enemies inside a circle. Indexed loop — deterministic on all peers. */
+function countWithin(x: number, y: number, radius: number, enemies: readonly Entity[]): number {
+  let n = 0;
+  const radiusSq = radius * radius;
+  for (let i = 0; i < enemies.length; i++) {
+    const e = enemies[i]!;
+    if (!e.alive) continue;
+    const dx = e.x - x;
+    const dy = e.y - y;
+    if (dx * dx + dy * dy <= radiusSq) n++;
+  }
+  return n;
 }
 
 /** Nearest living enemy at any distance — bots walk to a fight, they don't

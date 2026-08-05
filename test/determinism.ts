@@ -14,6 +14,8 @@ import { Hasher } from '../src/core/checksum';
 import { DEATH, ENEMY, PARTY_SIZE, PLAYER, ROOM, SIM } from '../src/core/constants';
 import { FixedLoop } from '../src/core/fixed-loop';
 import { Rng } from '../src/core/rng';
+import { CLASS_ORDER, ClassId, getClass } from '../src/game/classes';
+import { EventKind } from '../src/game/events';
 import { LifeState, lifeStateName } from '../src/game/life-state';
 import { World } from '../src/game/world';
 import type { InputState } from '../src/input/input-state';
@@ -532,7 +534,7 @@ export function checkDeathSystem(): CheckResult {
   const world = new World('death-seed', PARTY_SIZE);
   const victim = world.party[1]!.player;
 
-  victim.takeDamage(PLAYER.MAX_HP);
+  victim.takeDamage(victim.maxHp);
   if (victim.life !== LifeState.Downed) {
     return { name: '§8 death system', pass: false, detail: 'lethal damage did not down the player' };
   }
@@ -586,7 +588,7 @@ export function checkReviveRequiresSustainedChannel(): CheckResult {
   const victim = world.party[0]!.player;
   const rescuer = world.party[1]!.player;
 
-  victim.takeDamage(PLAYER.MAX_HP);
+  victim.takeDamage(victim.maxHp);
   rescuer.x = victim.x + 10;
   rescuer.y = victim.y;
 
@@ -629,12 +631,15 @@ export function checkReviveRequiresSustainedChannel(): CheckResult {
     world.step(SIM.STEP_SECONDS);
   }
 
-  const revived = lifeOf(victim) === LifeState.Alive && victim.hp === DEATH.REVIVE_HP;
+  // Revive HP is a fraction of the class's own pool now (§3 class HP ranges
+  // 82–150), not a flat number.
+  const expectedHp = victim.maxHp * (DEATH.REVIVE_HP_PERCENT / 100);
+  const revived = lifeOf(victim) === LifeState.Alive && victim.hp === expectedHp;
   return {
     name: 'revive needs an unbroken channel',
     pass: revived,
     detail: revived
-      ? `interrupt reset ${progressBeforeInterrupt} ticks; an unbroken 3s channel revived at ${DEATH.REVIVE_HP}hp`
+      ? `interrupt reset ${progressBeforeInterrupt} ticks; an unbroken 3s channel revived at ${expectedHp.toFixed(0)}hp`
       : `after a full channel: ${lifeStateName(lifeOf(victim))} at ${victim.hp}hp`,
   };
 }
@@ -651,7 +656,7 @@ export function checkBotsReviveEachOther(): CheckResult {
     slot.player.x = ROOM.WIDTH / 2;
     slot.player.y = ROOM.HEIGHT / 2;
   }
-  victim.takeDamage(PLAYER.MAX_HP);
+  victim.takeDamage(victim.maxHp);
 
   let sawChannel = false;
   const deadline = Math.round(DEATH.BLEED_OUT * SIM.TICK_RATE);
@@ -687,7 +692,7 @@ export function checkControllerInputIsCleared(): CheckResult {
     slot.player.x = ROOM.WIDTH / 2;
     slot.player.y = ROOM.HEIGHT / 2;
   }
-  victim.takeDamage(PLAYER.MAX_HP);
+  victim.takeDamage(victim.maxHp);
 
   // Run until someone has pressed the context action to revive.
   let everPressed = false;
@@ -741,7 +746,7 @@ export function checkRescuerDoesNotThrash(): CheckResult {
     slot.player.x = ROOM.WIDTH / 2 + offsets[i]!;
     slot.player.y = ROOM.HEIGHT / 2;
   });
-  victim.takeDamage(PLAYER.MAX_HP);
+  victim.takeDamage(victim.maxHp);
 
   const channelTicks = Math.round(DEATH.REVIVE_CHANNEL * SIM.TICK_RATE);
   // One channel, plus a generous allowance for the walk. Before the fix this
@@ -782,6 +787,132 @@ export function checkRescuerDoesNotThrash(): CheckResult {
   };
 }
 
+export function checkAllAbilitiesFire(): CheckResult {
+  // Twelve abilities across four classes. If a bot never presses one, that
+  // ability is untested — and untested is exactly where the revive bugs were
+  // hiding. This watches the event stream for each id actually executing.
+  const seen = new Set<string>();
+  const script = makeInputScript('abilities', 5400);
+
+  // All four slots bot-driven so every class is exercised, and a long enough
+  // run for the resource-gated payoffs to come up.
+  const world = new World('ability-coverage', 0);
+  for (let t = 0; t < script.length && !world.runOver; t++) {
+    world.step(SIM.STEP_SECONDS);
+    for (let i = 0; i < world.events.length; i++) {
+      const event = world.events.at(i);
+      if (event.kind === EventKind.Ability && event.ability) seen.add(event.ability);
+    }
+  }
+
+  const expected: string[] = [];
+  for (const id of CLASS_ORDER) {
+    for (const ability of getClass(id).abilities) expected.push(ability.id);
+  }
+  const missing = expected.filter((id) => !seen.has(id));
+
+  return {
+    name: 'bots fire every class ability',
+    pass: missing.length === 0,
+    detail:
+      missing.length === 0
+        ? `all ${expected.length} abilities fired within ${world.tick} ticks`
+        : `never fired: ${missing.join(', ')}`,
+  };
+}
+
+export function checkClassesActuallyDiffer(): CheckResult {
+  // §3.2 requires differentiation on at least four levers, not just damage.
+  // A regression here would be silent: four classes that play identically
+  // still pass every other check in this file.
+  const stats = CLASS_ORDER.map((id) => getClass(id));
+
+  const distinct = (values: readonly unknown[]): number => new Set(values).size;
+  const levers = {
+    moveSpeed: distinct(stats.map((s) => s.moveSpeed)),
+    cadence: distinct(stats.map((s) => s.attackInterval)),
+    resource: distinct(stats.map((s) => s.resource.kind)),
+    range: distinct(stats.map((s) => s.attackRange)),
+    traversal: distinct(stats.map((s) => s.abilities[0]!.id)),
+    silhouette: distinct(stats.map((s) => s.silhouette)),
+  };
+
+  // Every lever must genuinely separate all four, or it is not a lever.
+  const failed = Object.entries(levers).filter(([, count]) => count < CLASS_ORDER.length);
+
+  return {
+    name: '§3.2 classes differ on every lever',
+    pass: failed.length === 0,
+    detail:
+      failed.length === 0
+        ? `${Object.keys(levers).length} levers each separate all 4 classes`
+        : `not distinct: ${failed.map(([k, v]) => `${k}(${v}/4)`).join(', ')}`,
+  };
+}
+
+export function checkDashHitsEachEnemyOnce(): CheckResult {
+  // Regression: a dash is a moving hitbox swept every tick. Without per-dash
+  // dedup it re-hit the same body on all ~11 ticks of the sweep, making
+  // Charge do an order of magnitude more damage than its listed power.
+  const world = new World('dash-dedup', PARTY_SIZE, [
+    ClassId.Warrior,
+    ClassId.Warrior,
+    ClassId.Warrior,
+    ClassId.Warrior,
+  ]);
+  const user = world.localPlayer;
+  const charge = user.def.abilities[0]!;
+
+  // One enemy, parked directly in the dash path.
+  suppressEnemies(world);
+  world.step(SIM.STEP_SECONDS);
+  const victim = world.enemies[0]!;
+  victim.alive = true;
+  victim.hp = 100000; // survive the hit so we can measure it exactly
+  victim.maxHp = 100000;
+  victim.x = user.x + 120;
+  victim.y = user.y;
+  user.facingX = 1;
+  user.facingY = 0;
+
+  const press = makeInputState();
+  press.ability[0]!.down = true;
+  press.ability[0]!.pressed = true;
+
+  // Count hit events carrying the dash's damage. Measuring the victim's total
+  // HP loss would also catch the Warrior's basic attacks, which land on the
+  // same body during the dash — the first version of this check failed for
+  // exactly that reason (14 dash + 13 + 13 basic = 40).
+  let dashHits = 0;
+  const countDashHits = (): void => {
+    for (let i = 0; i < world.events.length; i++) {
+      const e = world.events.at(i);
+      if (e.kind !== EventKind.Hit && e.kind !== EventKind.Kill) continue;
+      if (Math.abs(e.amount - charge.power) < 0.0001) dashHits++;
+    }
+  };
+
+  world.setInput(0, press);
+  world.step(SIM.STEP_SECONDS);
+  countDashHits();
+
+  // Run out the whole dash without re-pressing.
+  for (let t = 0; t < 30; t++) {
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+    countDashHits();
+  }
+
+  const pass = dashHits === 1;
+  return {
+    name: 'a dash hits each enemy once',
+    pass,
+    detail: pass
+      ? 'Charge connected with the swept body exactly once'
+      : `Charge landed ${dashHits} hits on one body — the sweep is re-hitting per tick`,
+  };
+}
+
 export function checkPartyWipeEndsRun(): CheckResult {
   // §8 `[LOCKED]`: total party wipe ends the run. No compromise.
   const world = new World('wipe-seed', 0);
@@ -789,7 +920,7 @@ export function checkPartyWipeEndsRun(): CheckResult {
     return { name: 'party wipe ends the run', pass: false, detail: 'run started already over' };
   }
 
-  for (const slot of world.party) slot.player.takeDamage(PLAYER.MAX_HP);
+  for (const slot of world.party) slot.player.takeDamage(slot.player.maxHp);
 
   const bleedTicks = Math.round(DEATH.BLEED_OUT * SIM.TICK_RATE);
   for (let t = 0; t < bleedTicks + 10 && !world.runOver; t++) {
@@ -834,6 +965,9 @@ export const CHECKS = [
   checkDeathSystem,
   checkReviveRequiresSustainedChannel,
   checkBotsReviveEachOther,
+  checkAllAbilitiesFire,
+  checkClassesActuallyDiffer,
+  checkDashHitsEachEnemyOnce,
   checkControllerInputIsCleared,
   checkRescuerDoesNotThrash,
   checkPartyWipeEndsRun,

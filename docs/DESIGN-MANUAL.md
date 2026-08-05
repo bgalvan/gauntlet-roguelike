@@ -1,5 +1,5 @@
 # DESIGN MANUAL — Untitled Co-op Roguelike
-**Version 0.12 · Last updated 2026-08-04**
+**Version 0.13 · Last updated 2026-08-05**
 
 > **STATUS: CANONICAL.** This document supersedes `coop-roguelike-spec.md` (v0.1) and `coop-roguelike-loot-and-party-items.md`. Both are archived; their content is folded in below. This is the single source of truth.
 
@@ -667,6 +667,17 @@ Ranked by actual impact:
 ---
 
 ## 18. CHANGELOG
+
+**v0.13 — 2026-08-05**
+- **Four launch classes built as data** (§3.1): Warrior, Archer, Sorcerer, Valkyrie. All §3.2 levers now genuinely separate all four — movement speed, attack cadence, resource system, range, traversal, and silhouette. A harness check asserts this, so a future class that plays like an existing one fails the build.
+- **All twelve abilities implemented** per §3.3's slot table, including the held Valkyrie block reading the analog trigger. Slot 3 payoffs land as room-wide events (heavy stagger + knockback) rather than just damage, which is the "punctuation, not rhythm" distinction §3.3 asks for.
+- **Pillar 1 taken literally.** Classes are four distinct outlines — wedge, chevron, orb, hexagon — not one circle in four colours. Colour alone fails "identify by shape and screen effect alone" as written, and fails colourblind players outright.
+- **Class select screen**, driven through the same input abstraction as the game, so it works on keyboard, mouse and gamepad with no separate code paths.
+- **Presentation layer added**: knockback and per-body stagger (simulation, checksummed) plus particles, screen shake, damage numbers, a damage vignette and synthesized audio (render-only, one-way). The split is enforced by an `EventBuffer` the sim fills and the renderer drains — a cosmetic effect that fed back would desync peers on different window sizes, invisibly.
+- **`[OPEN]` contradiction surfaced, not resolved:** §3.2 gives the Archer no resource ("pure skill") while §3.3 says slot 3 is resource-gated. Built with the Archer's payoff on a long cooldown instead. Needs a ruling.
+- **Bots exercise all twelve abilities**, including a "hold your resource when the room warrants the payoff" rule. Without it the signature drained the pool on cooldown and Deep Freeze and Shield Slam were unreachable dead code.
+- Bugs found and fixed while building: a dash re-hit the same body every tick of its sweep (~3× listed damage); stamina regenerated straight through a held block, making it nearly free; and per-tick rescuer re-election meant a revive channel could never complete once the party was hurt.
+- Balance remains deliberately untouched. There are still no items, upgrades or economy to balance against.
 
 **v0.12 — 2026-08-04**
 - Phase 0 skeleton built: fixed-timestep loop, input abstraction (M+K and gamepad per §16.0), seeded PRNG, one room. Determinism harness and desync checksums added alongside, since §16.3 lockstep depends on both.

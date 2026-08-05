@@ -2,6 +2,7 @@ import Phaser from 'phaser';
 
 import { ROOM } from './core/constants';
 import { GameScene } from './scenes/game-scene';
+import { SelectScene } from './scenes/select-scene';
 
 const game = new Phaser.Game({
   type: Phaser.AUTO,
@@ -18,7 +19,7 @@ const game = new Phaser.Game({
   render: { pixelArt: false, antialias: true },
   // No Phaser physics or Phaser timers: the simulation is ours and runs on a
   // fixed timestep (constraint #3).
-  scene: [GameScene],
+  scene: [SelectScene, GameScene],
 });
 
 // Dev-only inspection hook. Stripped from production builds by the

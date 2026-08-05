@@ -1,98 +1,178 @@
 import type { Hasher } from '../../core/checksum';
-import { DEATH, PLAYER, SIM } from '../../core/constants';
+import { COMBAT, DEATH, PLAYER, SIM } from '../../core/constants';
 import type { InputState } from '../../input/input-state';
+import { applyHit, damageArea, executeAbility } from '../abilities';
+import type { AbilityContext } from '../abilities';
+import { AttackStyle, ResourceKind, getClass } from '../classes';
+import type { ClassDef, ClassId } from '../classes';
+import { EventKind } from '../events';
 import { LifeState } from '../life-state';
 import { overrideHoldTicks, selectTarget } from '../targeting';
 import { Entity } from './entity';
 
-const ATTACK_INTERVAL_TICKS = Math.round(PLAYER.ATTACK_INTERVAL * SIM.TICK_RATE);
-const ATTACK_RANGE_SQ = PLAYER.ATTACK_RANGE * PLAYER.ATTACK_RANGE;
 const BLEED_OUT_TICKS = Math.round(DEATH.BLEED_OUT * SIM.TICK_RATE);
 const REVIVE_CHANNEL_TICKS = Math.round(DEATH.REVIVE_CHANNEL * SIM.TICK_RATE);
 
+/** A lingering damage zone — Archer's Volley. */
+interface Zone {
+  x: number;
+  y: number;
+  radius: number;
+  power: number;
+  ticksLeft: number;
+  interval: number;
+  sinceLastTick: number;
+}
+
 /**
- * Placeholder player. No class kit yet — the ability slots are wired to the
- * abstract input but bound to nothing, because class design (§3) is its own
- * milestone.
+ * A party member.
  *
- * What is real here: movement, auto-attack, and the §8 death state machine.
+ * Everything that differs between classes comes from the ClassDef (§3.1 —
+ * class definitions are data). This file holds the machinery all classes
+ * share: movement, auto-attack, the resource, the three ability slots, and
+ * the §8 death state machine.
  */
 export class Player extends Entity {
+  readonly def: ClassDef;
+
   /** Facing, kept as a unit vector so it survives standing still. */
   facingX = 0;
   facingY = 1;
 
-  /** Integer countdown to the next swing — see the note in Enemy about ticks. */
   private attackCooldown = 0;
 
-  /** Currently focused enemy, or null when nothing is in reach. */
   target: Entity | null = null;
 
-  /** Ticks left before a manual override decays back to auto-target. */
   private overrideTicks = 0;
   private overrideX = 0;
   private overrideY = 0;
 
-  /** Set for one tick when a swing lands — the renderer draws the arc. */
   attackedThisTick = false;
 
-  /** Party slot 0..3. Stable identity for colours, HUD, and later for
-   *  matching a remote peer's input stream to a body. */
   readonly slot: number;
-
-  /**
-   * Whether this slot is driven by a bot rather than from outside.
-   *
-   * Fixed at world construction and identical on every peer, so reading it is
-   * deterministic. Bots need it to elect a rescuer among themselves: a bot
-   * cannot defer to a human, because a human may simply never press the
-   * button, and the downed player then bleeds out while everyone waits.
-   */
   readonly botControlled: boolean;
+
+  // --- resource (§3.2) -----------------------------------------------------
+
+  resource = 0;
+
+  /** Per-slot cooldowns, in ticks. Index matches the ability tuple. */
+  private readonly cooldowns = [0, 0, 0];
+
+  /** True for the tick a held ability (Valkyrie block) is active. */
+  blocking = false;
+
+  /** Ticks of ally shield remaining (Valkyrie slam). */
+  shieldTicks = 0;
+
+  /** Render-only flourish for Blink. */
+  blinkTicks = 0;
+
+  // --- dash state ----------------------------------------------------------
+
+  private dashTicks = 0;
+  private dashX = 0;
+  private dashY = 0;
+  private dashSpeed = 0;
+  private dashDamage = 0;
+  private dashRadius = 0;
+  private dashKnockback = 0;
+  /** Enemies already struck by the current dash. A dash is a moving hitbox
+   *  swept every tick — without this it hits the same enemy every tick it
+   *  overlaps them (~11× the listed damage over a 0.18s dash). */
+  private readonly dashHitIds: number[] = [];
+
+  /** Lingering zones this player owns. At most a couple at a time. */
+  private readonly zones: Zone[] = [];
 
   // --- §8 death state ------------------------------------------------------
 
   life: LifeState = LifeState.Alive;
-
-  /** Ticks left before a Downed player becomes a Wraith. */
   bleedOutTicks = 0;
-
-  /** Ticks of ally channelling accumulated on this Downed player. */
   reviveTicks = 0;
-
-  /** True for one tick when an ally's channel completed. Render/audio hook. */
   revivedThisTick = false;
-
-  /** True for one tick on the Alive → Downed transition. */
   downedThisTick = false;
 
-  constructor(id: number, slot: number, x: number, y: number, botControlled: boolean) {
-    super(id, x, y, PLAYER.RADIUS, PLAYER.MAX_HP);
+  constructor(id: number, slot: number, x: number, y: number, botControlled: boolean, classId: ClassId) {
+    const def = getClass(classId);
+    super(id, x, y, PLAYER.RADIUS, def.maxHp);
+    this.def = def;
     this.slot = slot;
     this.botControlled = botControlled;
+    // Rage starts empty and is earned; mana and stamina start full.
+    this.resource = def.resource.kind === ResourceKind.Rage ? 0 : def.resource.max;
   }
 
-  /** Wraiths pass through everything — they cannot be hurt or blocked. */
   override get collides(): boolean {
     return this.life !== LifeState.Wraith;
   }
 
-  step(dt: number, input: InputState, enemies: readonly Entity[]): void {
+  get isDashing(): boolean {
+    return this.dashTicks > 0;
+  }
+
+  /** 0..1 for the HUD. Classes with no resource report 0. */
+  get resourceFraction(): number {
+    return this.def.resource.max > 0 ? this.resource / this.def.resource.max : 0;
+  }
+
+  cooldownFraction(slot: number): number {
+    const def = this.def.abilities[slot];
+    if (!def || def.cooldown <= 0) return 0;
+    return (this.cooldowns[slot] ?? 0) / (def.cooldown * SIM.TICK_RATE);
+  }
+
+  step(dt: number, input: InputState, ctx: AbilityContext): void {
     this.attackedThisTick = false;
     this.revivedThisTick = false;
     this.downedThisTick = false;
+    this.blocking = false;
 
-    this.move(dt, input);
+    if (this.blinkTicks > 0) this.blinkTicks--;
+    if (this.shieldTicks > 0) this.shieldTicks--;
+    for (let i = 0; i < 3; i++) {
+      if (this.cooldowns[i]! > 0) this.cooldowns[i]!--;
+    }
 
     if (this.life === LifeState.Alive) {
       this.updateOverride(input);
-      this.acquireTarget(enemies);
-      this.attack();
+      this.stepZones(dt, ctx);
+
+      // A staggered player still gets carried by knockback but cannot act.
+      if (this.staggerTicks === 0) {
+        this.tryAbilities(input, ctx);
+        this.moveOrDash(dt, input, ctx);
+        this.acquireTarget(ctx.enemies);
+        this.attack(ctx);
+      }
+
+      // Regen AFTER abilities, because tryAbilities is what sets `blocking`
+      // this tick. Regenerating first meant stamina regened straight through
+      // a held block, cutting its cost to nearly nothing.
+      this.regenerate(dt);
     } else {
       this.target = null;
       this.overrideTicks = 0;
+      this.move(dt, input);
       if (this.life === LifeState.Downed) this.bleedOut();
     }
+  }
+
+  // --- movement ------------------------------------------------------------
+
+  private moveOrDash(dt: number, input: InputState, ctx: AbilityContext): void {
+    if (this.dashTicks > 0) {
+      this.dashTicks--;
+      this.x += this.dashX * this.dashSpeed * dt;
+      this.y += this.dashY * this.dashSpeed * dt;
+
+      // A damaging dash is a moving hitbox — swept every tick so it connects
+      // with everything it actually passed through, but each enemy at most
+      // once per dash.
+      if (this.dashDamage > 0) this.dashSweep(ctx);
+      return;
+    }
+    this.move(dt, input);
   }
 
   private move(dt: number, input: InputState): void {
@@ -100,12 +180,15 @@ export class Player extends Entity {
     const my = input.moveVector.y;
     if (mx === 0 && my === 0) return;
 
-    const speed =
-      this.life === LifeState.Alive
-        ? PLAYER.MOVE_SPEED
-        : this.life === LifeState.Downed
-          ? DEATH.CRAWL_SPEED
-          : DEATH.WRAITH_SPEED;
+    let speed: number;
+    if (this.life === LifeState.Alive) {
+      // Blocking roots you in place-ish — the cost of the Valkyrie's mitigation.
+      speed = this.blocking ? this.def.moveSpeed * 0.45 : this.def.moveSpeed;
+    } else if (this.life === LifeState.Downed) {
+      speed = DEATH.CRAWL_SPEED;
+    } else {
+      speed = DEATH.WRAITH_SPEED;
+    }
 
     this.x += mx * speed * dt;
     this.y += my * speed * dt;
@@ -115,8 +198,141 @@ export class Player extends Entity {
       this.facingX = mx / len;
       this.facingY = my / len;
     }
-    // Walls are resolved centrally, so enemies obey them too.
   }
+
+  beginDash(
+    dirX: number,
+    dirY: number,
+    distance: number,
+    opts: { damage?: number; radius?: number; knockback?: number },
+  ): void {
+    const ticks = Math.max(1, Math.round(0.18 * SIM.TICK_RATE));
+    this.dashTicks = ticks;
+    this.dashX = dirX;
+    this.dashY = dirY;
+    this.dashSpeed = distance / (ticks * SIM.STEP_SECONDS);
+    this.dashDamage = opts.damage ?? 0;
+    this.dashRadius = opts.radius ?? 0;
+    this.dashKnockback = opts.knockback ?? 260;
+    this.dashHitIds.length = 0;
+    this.facingX = dirX;
+    this.facingY = dirY;
+  }
+
+  /** One tick of a damaging dash: hit everything in reach not already hit. */
+  private dashSweep(ctx: AbilityContext): void {
+    const reach = this.dashRadius + this.radius;
+    for (let i = 0; i < ctx.enemies.length; i++) {
+      const enemy = ctx.enemies[i]!;
+      if (!enemy.alive) continue;
+
+      let seen = false;
+      for (let j = 0; j < this.dashHitIds.length; j++) {
+        if (this.dashHitIds[j] === enemy.id) {
+          seen = true;
+          break;
+        }
+      }
+      if (seen) continue;
+
+      const dx = enemy.x - this.x;
+      const dy = enemy.y - this.y;
+      const hitReach = reach + enemy.radius;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > hitReach * hitReach) continue;
+
+      this.dashHitIds.push(enemy.id);
+      applyHit(this, enemy, this.dashDamage, dx, dy, Math.sqrt(distSq), ctx, {
+        knockback: this.dashKnockback,
+        stagger: COMBAT.HIT_STAGGER_TICKS,
+      });
+      this.gainOnHit();
+    }
+  }
+
+  beginZone(
+    x: number,
+    y: number,
+    radius: number,
+    power: number,
+    ticks: number,
+    interval: number,
+  ): void {
+    this.zones.push({ x, y, radius, power, ticksLeft: ticks, interval, sinceLastTick: 0 });
+  }
+
+  private stepZones(_dt: number, ctx: AbilityContext): void {
+    for (let i = this.zones.length - 1; i >= 0; i--) {
+      const zone = this.zones[i]!;
+      zone.ticksLeft--;
+      zone.sinceLastTick++;
+      if (zone.sinceLastTick >= zone.interval) {
+        zone.sinceLastTick = 0;
+        damageArea(this, zone.x, zone.y, zone.radius, zone.power, ctx, { knockback: 40 });
+      }
+      if (zone.ticksLeft <= 0) this.zones.splice(i, 1);
+    }
+  }
+
+  /** Read-only view for the renderer. */
+  get activeZones(): readonly Zone[] {
+    return this.zones;
+  }
+
+  // --- abilities -----------------------------------------------------------
+
+  private tryAbilities(input: InputState, ctx: AbilityContext): void {
+    for (let slot = 0; slot < 3; slot++) {
+      const def = this.def.abilities[slot]!;
+      const button = input.ability[slot]!;
+
+      // Held abilities fire every tick they are down; pressed ones only on
+      // the edge, which is why the input layer derives edges centrally.
+      const wants = def.held ? button.down : button.pressed;
+      if (!wants) continue;
+      if (this.cooldowns[slot]! > 0) continue;
+
+      const cost = def.spendsAll ? this.def.resource.max : def.cost;
+      if (cost > 0 && this.resource < cost) continue;
+
+      if (def.held) {
+        // Held abilities drain rather than pay up front.
+        const drain = this.def.resource.drain * SIM.STEP_SECONDS;
+        if (this.resource < drain) continue;
+        this.resource -= drain;
+      } else if (cost > 0) {
+        this.resource -= cost;
+      }
+
+      if (def.cooldown > 0) this.cooldowns[slot] = Math.round(def.cooldown * SIM.TICK_RATE);
+
+      const [dirX, dirY] = this.aimDirection();
+      executeAbility(def, this, dirX, dirY, ctx);
+    }
+  }
+
+  /**
+   * Where a directional ability points (§16.5b).
+   *
+   * The override direction when the player is expressing one, otherwise
+   * facing. Never a cursor position — abilities are directional, and that is
+   * what keeps mouse, stick and thumb equally expressive.
+   */
+  private aimDirection(): [number, number] {
+    if (this.overrideTicks > 0) return [this.overrideX, this.overrideY];
+    return [this.facingX, this.facingY];
+  }
+
+  private regenerate(dt: number): void {
+    const res = this.def.resource;
+    if (res.max <= 0) return;
+    // Stamina only regenerates when not blocking; mana always does.
+    if (res.regen > 0 && !this.blocking) {
+      this.resource = Math.min(res.max, this.resource + res.regen * dt);
+    }
+  }
+
+  // --- attacking -----------------------------------------------------------
 
   private updateOverride(input: InputState): void {
     if (input.targetOverride.active) {
@@ -135,11 +351,11 @@ export class Player extends Entity {
       this.overrideTicks > 0,
       this.overrideX,
       this.overrideY,
-      ATTACK_RANGE_SQ,
+      this.def.attackRange * this.def.attackRange,
     );
   }
 
-  private attack(): void {
+  private attack(ctx: AbilityContext): void {
     if (this.attackCooldown > 0) this.attackCooldown--;
 
     const target = this.target;
@@ -148,36 +364,85 @@ export class Player extends Entity {
 
     const dx = target.x - this.x;
     const dy = target.y - this.y;
-    if (dx * dx + dy * dy > ATTACK_RANGE_SQ) return;
+    const distSq = dx * dx + dy * dy;
+    if (distSq > this.def.attackRange * this.def.attackRange) return;
 
-    // Face what we hit — auto-target implies auto-face (constraint #6).
-    const len = Math.hypot(dx, dy);
-    if (len > 0) {
-      this.facingX = dx / len;
-      this.facingY = dy / len;
+    const dist = Math.sqrt(distSq);
+    if (dist > 0) {
+      this.facingX = dx / dist;
+      this.facingY = dy / dist;
     }
 
-    target.damage(PLAYER.ATTACK_DAMAGE);
-    this.attackCooldown = ATTACK_INTERVAL_TICKS;
+    if (this.def.attackStyle === AttackStyle.Projectile) {
+      ctx.spawnProjectile(
+        this.x,
+        this.y,
+        this.facingX,
+        this.facingY,
+        this.def.projectileSpeed,
+        this.def.attackDamage,
+        this.slot,
+      );
+    } else {
+      const wasAlive = target.alive;
+      target.damage(this.def.attackDamage);
+      target.applyKnockback(this.facingX, this.facingY, COMBAT.BASIC_KNOCKBACK);
+      target.stagger(COMBAT.HIT_STAGGER_TICKS);
+      ctx.events.emit(wasAlive && !target.alive ? EventKind.Kill : EventKind.Hit, target.x, target.y, {
+        amount: this.def.attackDamage,
+        dirX: this.facingX,
+        dirY: this.facingY,
+        slot: this.slot,
+      });
+    }
+
+    this.gainOnHit();
+    this.attackCooldown = Math.round(this.def.attackInterval * SIM.TICK_RATE);
     this.attackedThisTick = true;
+  }
+
+  /** Rage is built by landing hits (§3.2). Called for projectile impacts too. */
+  gainOnHit(): void {
+    const res = this.def.resource;
+    if (res.onHit <= 0) return;
+    this.resource = Math.min(res.max, this.resource + res.onHit);
   }
 
   // --- §8 transitions ------------------------------------------------------
 
-  /** Damage from an enemy. Only an Alive player can be hurt. */
-  takeDamage(amount: number): void {
-    if (this.life !== LifeState.Alive) return;
-    this.hp -= amount;
-    if (this.hp > 0) return;
+  takeDamage(amount: number, fromX = this.x, fromY = this.y): number {
+    if (this.life !== LifeState.Alive) return 0;
 
-    // Stage 1. Note the player is NOT `alive = false` — a Downed player is
-    // still a body in the world that allies can reach.
+    let final = amount;
+
+    // Valkyrie's block: mitigation from the cone she is facing. Directional,
+    // so it is a positioning decision rather than a reaction test.
+    if (this.blocking) {
+      const dx = fromX - this.x;
+      const dy = fromY - this.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 0) {
+        const dot = (dx / dist) * this.facingX + (dy / dist) * this.facingY;
+        if (dot >= Math.cos(COMBAT.BLOCK_CONE)) {
+          final *= this.def.abilities[1]!.power;
+        }
+      }
+    }
+
+    if (this.shieldTicks > 0) final *= 1 - COMBAT.SHIELD_ABSORB;
+
+    this.hp -= final;
+    if (this.hp > 0) return final;
+
     this.hp = 0;
     this.life = LifeState.Downed;
     this.bleedOutTicks = BLEED_OUT_TICKS;
     this.reviveTicks = 0;
     this.downedThisTick = true;
     this.target = null;
+    this.dashTicks = 0;
+    this.zones.length = 0;
+    return final;
   }
 
   private bleedOut(): void {
@@ -189,19 +454,10 @@ export class Player extends Entity {
     }
   }
 
-  /**
-   * Advance an ally's revive channel by one tick. Called by the world, which
-   * knows who is channelling — the player itself doesn't.
-   *
-   * @param channelling whether at least one ally is in range and holding the
-   *                    context action this tick
-   */
   advanceRevive(channelling: boolean): void {
     if (this.life !== LifeState.Downed) return;
 
     if (!channelling) {
-      // Interrupted. Resetting rather than decaying makes the 3s a real
-      // commitment — you cannot chip away at it between dodges.
       this.reviveTicks = 0;
       return;
     }
@@ -210,23 +466,20 @@ export class Player extends Entity {
     if (this.reviveTicks < REVIVE_CHANNEL_TICKS) return;
 
     this.life = LifeState.Alive;
-    this.hp = DEATH.REVIVE_HP;
+    this.hp = this.maxHp * (DEATH.REVIVE_HP_PERCENT / 100);
     this.bleedOutTicks = 0;
     this.reviveTicks = 0;
     this.revivedThisTick = true;
   }
 
-  /** 0..1 progress of an in-flight revive channel. Render-only. */
   get reviveProgress(): number {
     return this.reviveTicks / REVIVE_CHANNEL_TICKS;
   }
 
-  /** 0..1 of the bleed-out remaining. Render-only. */
   get bleedOutRemaining(): number {
     return this.bleedOutTicks / BLEED_OUT_TICKS;
   }
 
-  /** True while the player is holding a manual target pick. Debug/UI only. */
   get overrideActive(): boolean {
     return this.overrideTicks > 0;
   }
@@ -242,8 +495,21 @@ export class Player extends Entity {
       .int(this.life)
       .int(this.bleedOutTicks)
       .int(this.reviveTicks)
-      // Target identity, not the object — a peer that picked a different
-      // enemy has already desynced even if positions still agree.
+      .float(this.resource)
+      .int(this.cooldowns[0]!)
+      .int(this.cooldowns[1]!)
+      .int(this.cooldowns[2]!)
+      .bool(this.blocking)
+      .int(this.shieldTicks)
+      .int(this.dashTicks)
+      .int(this.dashHitIds.length)
+      .int(this.zones.length)
       .int(this.target ? this.target.id : -1);
+    // Zone internals decide future damage ticks — a peer whose volley is one
+    // tick ahead has already diverged.
+    for (let i = 0; i < this.zones.length; i++) {
+      const zone = this.zones[i]!;
+      h.float(zone.x).float(zone.y).int(zone.ticksLeft).int(zone.sinceLastTick);
+    }
   }
 }

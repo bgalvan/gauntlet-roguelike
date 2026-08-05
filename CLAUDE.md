@@ -48,11 +48,13 @@ When a design decision is made in a session, update the manual and add a changel
 
 **Phase 0 — prototype skeleton. DONE.** Fixed-timestep loop · input abstraction with M+K and gamepad backends · seeded PRNG · one room with movement and auto-attack. Determinism harness and bot party added on top.
 
-**Phase 1 — combat foundation. In progress.** Collision, an Act I melee enemy with a telegraphed wind-up, waves with §2 party scaling, and the §8 death system (stages 1–2).
+**Phase 1 — combat foundation. DONE.** Collision, an Act I melee enemy with a telegraphed wind-up, waves with §2 party scaling, and the §8 death system (stages 1–2).
 
-Still absent, in rough dependency order: room templates and the layout graph · shared camera and locked doors · classes and the three ability slots · items and upgrade axes · a boss.
+**Phase 2 — classes, abilities and feel. DONE.** Four launch classes as data (§3.1), all twelve abilities, per-class resources, projectiles, knockback and stagger, a class-select screen, and the presentation layer — silhouettes, particles, screen shake, damage numbers, synthesized audio.
 
-No procedural generation, no items, no classes yet. **Ask before expanding scope past the current milestone.**
+Still absent, in rough dependency order: room templates and the layout graph · shared camera and locked doors · items and the upgrade axes (§4) · weapon sidegrades (§5) · a boss · the Necromancer (post-launch unlock per §3.1).
+
+**Ask before expanding scope past the current milestone.**
 
 ## Commands
 
@@ -74,16 +76,47 @@ No linter yet — TypeScript is in strict mode with `noUnusedLocals`, `noUncheck
 
 ```
 src/
-  core/        constants · rng · fixed-loop · checksum   — engine-agnostic
+  core/        constants · rng · fixed-loop · checksum      — engine-agnostic
   input/       input-state · input-manager · backends/{keyboard-mouse,gamepad}
-  game/        world · targeting · collision · controller · bot · life-state
-               entities/{entity,player,enemy}
-  scenes/      game-scene.ts                             — the only Phaser-aware file besides main.ts
+  game/        world · classes · abilities · targeting · collision
+               controller · bot · life-state · events
+               entities/{entity,player,enemy,projectile}   — no Phaser, no DOM
+  render/      silhouette · particles · audio              — render-only helpers
+  scenes/      select-scene · game-scene                   — Phaser-aware
 test/
-  determinism.ts                                         — run with `npm test`
+  determinism.ts                                           — run with `npm test`
 ```
 
-**The rule that keeps constraints #1 and #3 honest:** `src/game/` and `src/core/` import no Phaser and read no DOM. The simulation runs headless; the scene renders it. Input crosses the boundary only as `InputState`. If a `import Phaser` ever appears under `game/`, something has gone wrong.
+**The rule that keeps constraints #1 and #3 honest:** `src/game/` and `src/core/` import no Phaser and read no DOM. The simulation runs headless; the scenes render it. Input crosses the boundary only as `InputState`. If an `import Phaser` ever appears under `game/`, something has gone wrong.
+
+## Classes and abilities (§3)
+
+Class definitions are **data**, in `src/game/classes.ts` — §3.1 asks that adding a class be content work, not engineering. A `ClassDef` carries the §3.2 levers (HP, move speed, attack cadence, range, attack style, resource) plus exactly three `AbilityDef`s. The tuple is fixed-length by type, which is how constraint #2's four-input budget is enforced at compile time.
+
+Ability *behaviour* is keyed by id in `src/game/abilities.ts`. A new class reusing existing ability kinds touches only `classes.ts`.
+
+| | Warrior | Archer | Sorcerer | Valkyrie |
+|---|---|---|---|---|
+| Resource | Rage (on hit) | none | Mana (regen) | Stamina (drains) |
+| 1 Traversal | Charge | Dash | Blink | Shield Plow |
+| 2 Signature | Whirlwind | Charged Shot | Heavy Blast | Block *(held)* |
+| 3 Payoff | Shockwave | Volley | Deep Freeze | Shield Slam |
+
+**Known contradiction, flagged not resolved:** §3.2 gives the Archer no resource ("pure skill"), but §3.3 says slot 3 is resource-gated. The Archer's payoff runs on a long cooldown instead. Bobby's call.
+
+Bots use all twelve. `checkAllAbilitiesFire` asserts it — three of four classes would otherwise be untested, and untested is where every bug so far has lived. Bots also **hold their resource when the room already warrants the payoff**; without that rule the signature drained the pool on cooldown and Deep Freeze and Shield Slam literally never fired.
+
+## Juice, and the line it must not cross
+
+**Knockback and stagger are simulation.** They move bodies, so they are deterministic, checksummed, and identical on every peer.
+
+**Screen shake, particles, damage numbers and audio are render-only.** They are driven by a one-way `EventBuffer` the sim fills each tick and the renderer drains. Nothing in `src/render/` or the scenes ever writes back into the world.
+
+That split is the whole design. A cosmetic effect that fed back into the sim would desync two peers whose windows are different sizes — and it would do so invisibly.
+
+Hit-stop is per-body (`Entity.staggerTicks`) rather than a global freeze. A global freeze feels better but has to be identical on every peer, which fits lockstep badly.
+
+`Particles` uses its own seeded `Rng` rather than `Math.random`, so replays look identical and `Math.random` stays absent from the whole codebase — which is what keeps the harness's trap check meaningful. `audio.ts` is the one exception, and it is commented as such.
 
 ## Party and controllers
 
@@ -102,7 +135,9 @@ Bot decisions are a pure function of world state plus a forked PRNG, so **lockst
 
 Bots also never defer to a human for a revive — a human may simply never press the button, and the victim bleeds out while the party waits. That is what `Player.botControlled` is for.
 
-Bots hold a standoff band at ~72% of attack range and steer apart from allies. That separation is standing in for collision, which arrives in Phase 1 — without it four bodies occupy one pixel and §13's readability question can't be asked.
+Bots hold a standoff band at ~72% of **their own class's** attack range and steer apart from allies. Per-class matters: an Archer at 330 range and a Warrior at 116 want completely different spacing, and one shared number made every class fight like a Warrior.
+
+Escape abilities (Dash, Blink) trigger on an **absolute** distance, not a fraction of attack range. The Archer's standoff is 238 and 70% of its range is 231, so a range-relative threshold could never fire — the bot was always already further away than its own escape condition required.
 
 ## Combat and death (§8)
 
@@ -131,9 +166,13 @@ These have been mutation-tested — injecting `Math.random` into world generatio
 
 Combat adds: collision keeps bodies apart (sampled every tick, not just the last one) · nothing escapes the room · the §8 stage transitions · revive needs an unbroken channel · bots revive a downed ally · a party wipe ends the run.
 
+Classes add: **every one of the twelve abilities actually fires** · the §3.2 levers each separate all four classes · a dash hits each body exactly once.
+
 Checks that isolate a mechanic call `suppressEnemies` — otherwise a rescuer standing still for a 3s channel gets beaten down and the check fails for reasons unrelated to what it tests.
 
-Two checks are deliberately non-vacuous: the bot replay check also asserts bots *left the spawn ring* (a party of statues would satisfy every determinism check ever written), and the separation check asserts dummies are taking damage.
+Several checks are deliberately non-vacuous: the bot replay check asserts bots *left the spawn ring* (a party of statues satisfies every determinism check ever written), the separation check asserts enemies are taking damage, and the ability check enumerates ids from the class table rather than a hardcoded list, so a new class cannot be silently untested.
+
+The dash check counts **hit events carrying the dash's damage**, not the victim's total HP loss — the first version failed because the Warrior's basic attacks land on the same body mid-dash (14 dash + 13 + 13 basic = 40).
 
 ## Working rules
 

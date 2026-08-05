@@ -15,12 +15,15 @@ import type { Entity } from './entities/entity';
  * a uniform grid is the fix when it bites.
  */
 export function resolveCollisions(bodies: readonly Entity[]): void {
+  // Walls are clamped *inside* the loop, not just at the end.
+  //
+  // Clamping only once at the end reintroduces overlap: a body shoved into a
+  // wall by knockback gets pushed back out into its neighbour, with no pass
+  // left to separate them again. Measured after knockback landed — two
+  // enemies against a wall ended 13u deep, nearly half a body.
   for (let pass = 0; pass < COLLISION.ITERATIONS; pass++) {
     separate(bodies);
-  }
-  // Walls last, so nothing is left pushed through one.
-  for (let i = 0; i < bodies.length; i++) {
-    clampToRoom(bodies[i]!);
+    for (let i = 0; i < bodies.length; i++) clampToRoom(bodies[i]!);
   }
 }
 
