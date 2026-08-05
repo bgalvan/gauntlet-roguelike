@@ -2,7 +2,7 @@ import { Hasher } from '../core/checksum';
 import { DEATH, PARTY_SIZE, PLAYER, ROOM, SIM, WAVE } from '../core/constants';
 import { Rng } from '../core/rng';
 import type { InputState } from '../input/input-state';
-import { makeInputState } from '../input/input-state';
+import { clearInputState, makeInputState } from '../input/input-state';
 import { BotController } from './bot';
 import { resolveCollisions } from './collision';
 import type { PlayerController } from './controller';
@@ -69,19 +69,20 @@ export class World {
     const spawnRadius = PLAYER.RADIUS * 5;
     for (let slot = 0; slot < PARTY_SIZE; slot++) {
       const angle = (slot / PARTY_SIZE) * Math.PI * 2;
+      const isBot = slot >= humanSlots;
       const player = new Player(
         this.nextEntityId++,
         slot,
         ROOM.WIDTH / 2 + Math.cos(angle) * spawnRadius,
         ROOM.HEIGHT / 2 + Math.sin(angle) * spawnRadius,
+        isBot,
       );
 
       // Each bot gets its own forked stream, so a bot consuming a different
       // number of rolls can never shift another system's sequence.
-      const controller: PlayerController =
-        slot < humanSlots
-          ? new HumanController(makeInputState())
-          : new BotController(this.rng.fork());
+      const controller: PlayerController = isBot
+        ? new BotController(this.rng.fork())
+        : new HumanController(makeInputState());
 
       this.party.push({ player, controller, input: makeInputState() });
     }
@@ -127,6 +128,11 @@ export class World {
     // happens to sit before or after another player in the array.
     for (let i = 0; i < this.party.length; i++) {
       const slot = this.party[i]!;
+      // Clear first. Controllers write only the fields they care about, so
+      // without this a button stays held forever after one press — a bot that
+      // pressed the context action once kept "holding" it for the rest of the
+      // run. Harmless for movement, silently wrong for every button.
+      clearInputState(slot.input);
       slot.controller.produceInput(slot.player, this.playerCache, this.enemies, slot.input);
     }
 

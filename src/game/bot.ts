@@ -4,6 +4,7 @@ import type { Rng } from '../core/rng';
 import type { InputState } from '../input/input-state';
 import { clampToUnit } from '../input/input-state';
 import type { PlayerController } from './controller';
+import { distanceSq } from './entities/entity';
 import type { Entity } from './entities/entity';
 import type { Player } from './entities/player';
 import { LifeState } from './life-state';
@@ -41,6 +42,9 @@ export class BotController implements PlayerController {
 
   /** Hysteresis latch for the retreat behaviour. */
   private retreating = false;
+
+  /** Entity id of the ally this bot has committed to reviving, or -1. */
+  private rescueTargetId = -1;
 
   constructor(rng: Rng) {
     this.rng = rng;
@@ -86,9 +90,19 @@ export class BotController implements PlayerController {
     let steerX = 0;
     let steerY = 0;
 
-    // Reviving outranks fighting. A downed ally is on a 20s clock (§8) and
-    // the party is a body down until they're up.
-    const rescue = this.nearestDownedAlly(self, allies);
+    // Self-preservation, with hysteresis so it doesn't oscillate on the
+    // threshold. Evaluated before the rescue check, because whether this bot
+    // is retreating decides whether it should be the one to commit.
+    const healthFraction = self.hp / self.maxHp;
+    if (this.retreating) {
+      if (healthFraction >= BOT.REENGAGE_HP) this.retreating = false;
+    } else if (healthFraction < BOT.RETREAT_HP) {
+      this.retreating = true;
+    }
+
+    // Reviving outranks fighting for the elected rescuer. A downed ally is on
+    // a 20s clock (§8) and the party is a body down until they're up.
+    const rescue = this.pickRescue(self, allies);
     if (rescue) {
       const dx = rescue.x - self.x;
       const dy = rescue.y - self.y;
@@ -114,16 +128,8 @@ export class BotController implements PlayerController {
       return;
     }
 
-    // Self-preservation, with hysteresis so it doesn't oscillate on the
-    // threshold. Auto-attack keeps firing while retreating (constraint #6 —
-    // attacks aren't aimed), so a kiting bot is still contributing.
-    const healthFraction = self.hp / self.maxHp;
-    if (this.retreating) {
-      if (healthFraction >= BOT.REENGAGE_HP) this.retreating = false;
-    } else if (healthFraction < BOT.RETREAT_HP) {
-      this.retreating = true;
-    }
-
+    // Auto-attack keeps firing while retreating (constraint #6 — attacks
+    // aren't aimed), so a kiting bot is still contributing.
     const target = nearestLiving(self, enemies);
 
     if (target) {
@@ -280,6 +286,86 @@ export class BotController implements PlayerController {
     // the prototype is meant to answer.
   }
 
+  /**
+   * The downed ally this bot should go and revive — or null if someone else
+   * should.
+   *
+   * Reviving means standing still for three seconds. When every bot committed
+   * to the same body, the whole party stopped fighting and stopped dodging in
+   * the middle of a swarm, and all of them died standing over it. Measured:
+   * the channel would reach ~80/180 before every rescuer went down, so the
+   * victim bled out and the party wiped. §8 explicitly warns against building
+   * things that pile on when the party is already losing.
+   *
+   * So: exactly one rescuer per body, and never a bot that is itself hurt
+   * enough to be retreating.
+   */
+  private pickRescue(self: Player, allies: readonly Player[]): Player | null {
+    // Honour an existing commitment before re-electing.
+    //
+    // This is the important line. Electing a rescuer fresh every tick looks
+    // reasonable and does not work: channelling means standing still, standing
+    // still means taking hits, taking hits drops you below the health bar that
+    // qualifies you — so the job is handed to a healthy bot on the far side of
+    // the room, the 3s channel restarts from zero, and by the time that one
+    // arrives it happens again. Measured: the channel reached 86/180, then
+    // 10/180, then 35/180, and the victim bled out with three allies alive.
+    if (this.rescueTargetId !== -1) {
+      const committed = findById(allies, this.rescueTargetId);
+      if (committed && committed.life === LifeState.Downed) return committed;
+      this.rescueTargetId = -1;
+    }
+
+    const victim = this.nearestDownedAlly(self, allies);
+    if (!victim) return null;
+
+    // Candidates are other *bots* only. A bot cannot defer to a human: the
+    // human may never press the button, and the victim bleeds out while the
+    // party politely waits. Measured before this rule existed — a full 20s
+    // bleed-out with three allies standing by.
+    //
+    // Health is judged by HP rather than by the private `retreating` latch, so
+    // every bot evaluates every candidate — including itself — by the same
+    // observable rule and they all elect the same rescuer with no messaging.
+    const selfHealthy = self.hp / self.maxHp >= BOT.RETREAT_HP;
+
+    let anyHealthy = selfHealthy;
+    if (!anyHealthy) {
+      for (let i = 0; i < allies.length; i++) {
+        const other = allies[i]!;
+        if (other.id === self.id || !other.botControlled) continue;
+        if (other.life !== LifeState.Alive) continue;
+        if (other.hp / other.maxHp >= BOT.RETREAT_HP) {
+          anyHealthy = true;
+          break;
+        }
+      }
+    }
+
+    // Healthy bots do the rescuing — but if none are healthy, the hurt ones
+    // are eligible rather than nobody. An election that can elect no one is
+    // how the whole party ends up watching someone bleed out.
+    if (anyHealthy && !selfHealthy) return null;
+
+    const selfDistSq = distanceSq(self, victim);
+    for (let i = 0; i < allies.length; i++) {
+      const other = allies[i]!;
+      if (other.id === self.id || !other.botControlled) continue;
+      if (other.life !== LifeState.Alive) continue;
+      if (anyHealthy && other.hp / other.maxHp < BOT.RETREAT_HP) continue;
+
+      const otherDistSq = distanceSq(other, victim);
+      // Strictly closer wins; equal distance is broken by id so every peer
+      // elects the same rescuer without any communication.
+      if (otherDistSq < selfDistSq || (otherDistSq === selfDistSq && other.id < self.id)) {
+        return null;
+      }
+    }
+
+    this.rescueTargetId = victim.id;
+    return victim;
+  }
+
   private nearestDownedAlly(self: Player, allies: readonly Player[]): Player | null {
     let best: Player | null = null;
     let bestDistSq = Infinity;
@@ -303,9 +389,17 @@ export class BotController implements PlayerController {
       .int(this.age)
       .int(this.strafeSign)
       .bool(this.retreating)
+      .int(this.rescueTargetId)
       .float(this.jitterX)
       .float(this.jitterY);
   }
+}
+
+function findById(players: readonly Player[], id: number): Player | null {
+  for (let i = 0; i < players.length; i++) {
+    if (players[i]!.id === id) return players[i]!;
+  }
+  return null;
 }
 
 /** Nearest living enemy at any distance — bots walk to a fight, they don't

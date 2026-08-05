@@ -60,6 +60,7 @@ No procedural generation, no items, no classes yet. **Ask before expanding scope
 |---|---|
 | `npm install` | Install dependencies |
 | `npm run dev` | Vite dev server with HMR — http://localhost:5173 |
+| — | In dev, `window.__game` exposes the Phaser game for console inspection (`__game.scene.getScene('game').world`). Stripped from production builds. |
 | `npm test` | Determinism harness — headless, no browser |
 | `npm run typecheck` | `tsc --noEmit` (strict) |
 | `npm run build` | Typecheck, then production bundle to `dist/` |
@@ -93,6 +94,13 @@ The world always has `PARTY_SIZE` (4) slots. `new World(seed, humanSlots)` decid
 Bot decisions are a pure function of world state plus a forked PRNG, so **lockstep peers derive identical bot behaviour independently — bot inputs never go over the wire.**
 
 `World.step` runs controllers in two passes: every controller decides against the same start-of-tick state, so a bot's choice can't depend on its index in the array.
+
+**Two rules learned the hard way, both from a real bug report:**
+
+1. **The world clears each slot's `InputState` before the controller writes it.** Controllers only write the fields they care about, so without the clear a button stays held forever after one press. Currently only the context action is bound, so it was nearly invisible — it would silently break every ability slot the moment §3.3 lands.
+2. **A bot that commits to reviving stays committed.** Re-electing a rescuer each tick is the obvious design and it does not work: channelling means standing still, standing still means taking hits, and taking hits disqualified the current rescuer — handing the job to a healthy bot across the room and restarting the 3s channel from zero. Any per-tick "pick the best agent for this job" election has this failure mode.
+
+Bots also never defer to a human for a revive — a human may simply never press the button, and the victim bleeds out while the party waits. That is what `Player.botControlled` is for.
 
 Bots hold a standoff band at ~72% of attack range and steer apart from allies. That separation is standing in for collision, which arrives in Phase 1 — without it four bodies occupy one pixel and §13's readability question can't be asked.
 

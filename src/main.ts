@@ -3,7 +3,7 @@ import Phaser from 'phaser';
 import { ROOM } from './core/constants';
 import { GameScene } from './scenes/game-scene';
 
-new Phaser.Game({
+const game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
   width: ROOM.WIDTH,
@@ -20,3 +20,10 @@ new Phaser.Game({
   // fixed timestep (constraint #3).
   scene: [GameScene],
 });
+
+// Dev-only inspection hook. Stripped from production builds by the
+// `import.meta.env.DEV` guard. Lets a debugger read live simulation state
+// from the console instead of inferring it from pixels.
+if (import.meta.env.DEV) {
+  (globalThis as Record<string, unknown>)['__game'] = game;
+}

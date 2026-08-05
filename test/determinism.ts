@@ -673,6 +673,115 @@ export function checkBotsReviveEachOther(): CheckResult {
   };
 }
 
+export function checkControllerInputIsCleared(): CheckResult {
+  // Regression: controllers write only the fields they care about, so the
+  // world must hand them a cleared buffer. Without that a button pressed once
+  // stays held for the rest of the run — a downed bot was still reporting the
+  // context action held. Only the context action is bound today, so this is
+  // currently benign; it would silently break every ability slot the moment
+  // §3.3 lands.
+  const world = new World('input-clear', 0); // all bots
+  const victim = world.party[1]!.player;
+
+  for (const slot of world.party) {
+    slot.player.x = ROOM.WIDTH / 2;
+    slot.player.y = ROOM.HEIGHT / 2;
+  }
+  victim.takeDamage(PLAYER.MAX_HP);
+
+  // Run until someone has pressed the context action to revive.
+  let everPressed = false;
+  for (let t = 0; t < 600 && lifeOf(victim) === LifeState.Downed; t++) {
+    suppressEnemies(world);
+    world.step(SIM.STEP_SECONDS);
+    if (world.party.some((s) => s.input.contextAction.down)) everPressed = true;
+  }
+
+  if (!everPressed) {
+    return {
+      name: 'controller input is cleared each tick',
+      pass: false,
+      detail: 'no bot ever pressed the context action — the check proves nothing',
+    };
+  }
+
+  // Nobody is downed now, so nobody should still be holding the button.
+  for (let t = 0; t < 120; t++) {
+    suppressEnemies(world);
+    world.step(SIM.STEP_SECONDS);
+  }
+
+  const stuck = world.party.filter((s) => s.input.contextAction.down).map((s) => s.player.slot);
+  return {
+    name: 'controller input is cleared each tick',
+    pass: stuck.length === 0,
+    detail:
+      stuck.length === 0
+        ? 'context action released once no ally needed reviving'
+        : `slots ${stuck.join(',')} still report the context action held`,
+  };
+}
+
+export function checkRescuerDoesNotThrash(): CheckResult {
+  // Regression for the reported bug: revives worked twice, then stopped.
+  //
+  // Cause: the rescuer was re-elected every tick. Channelling means standing
+  // still, standing still means taking hits, and taking hits disqualified the
+  // current rescuer — handing the job to a healthy bot across the room and
+  // resetting the 3s channel. Here the channelling bot is damaged every tick
+  // to force exactly that.
+  const world = new World('thrash', 1); // slot 0 human and never presses E
+  const victim = world.localPlayer;
+
+  victim.x = ROOM.WIDTH / 2;
+  victim.y = ROOM.HEIGHT / 2;
+  // One bot close, two far — the far ones are the tempting re-elections.
+  const offsets = [70, 260, 430];
+  world.party.slice(1).forEach((slot, i) => {
+    slot.player.x = ROOM.WIDTH / 2 + offsets[i]!;
+    slot.player.y = ROOM.HEIGHT / 2;
+  });
+  victim.takeDamage(PLAYER.MAX_HP);
+
+  const channelTicks = Math.round(DEATH.REVIVE_CHANNEL * SIM.TICK_RATE);
+  // One channel, plus a generous allowance for the walk. Before the fix this
+  // never completed at all.
+  const deadline = channelTicks + 300;
+
+  let channeller = -1;
+  let switches = 0;
+
+  for (let t = 0; t < deadline && lifeOf(victim) === LifeState.Downed; t++) {
+    suppressEnemies(world);
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+
+    const active = world.party.find(
+      (s) =>
+        s.player.botControlled &&
+        s.player.life === LifeState.Alive &&
+        s.input.contextAction.down &&
+        Math.hypot(s.player.x - victim.x, s.player.y - victim.y) <= DEATH.REVIVE_RANGE,
+    );
+    if (active) {
+      if (channeller !== -1 && active.player.id !== channeller) switches++;
+      channeller = active.player.id;
+      // Standing still in a fight costs health. This is what disqualified the
+      // rescuer under the old every-tick election.
+      active.player.takeDamage(0.4);
+    }
+  }
+
+  const revived = lifeOf(victim) === LifeState.Alive;
+  return {
+    name: 'a committed rescuer does not hand off mid-channel',
+    pass: revived && switches === 0,
+    detail: revived
+      ? `revived in ${world.tick} ticks with ${switches} hand-offs`
+      : `victim still ${lifeStateName(lifeOf(victim))} after ${deadline} ticks, ${switches} hand-offs`,
+  };
+}
+
 export function checkPartyWipeEndsRun(): CheckResult {
   // §8 `[LOCKED]`: total party wipe ends the run. No compromise.
   const world = new World('wipe-seed', 0);
@@ -725,6 +834,8 @@ export const CHECKS = [
   checkDeathSystem,
   checkReviveRequiresSustainedChannel,
   checkBotsReviveEachOther,
+  checkControllerInputIsCleared,
+  checkRescuerDoesNotThrash,
   checkPartyWipeEndsRun,
 ] as const;
 

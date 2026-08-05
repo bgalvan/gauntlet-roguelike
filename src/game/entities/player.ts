@@ -40,6 +40,16 @@ export class Player extends Entity {
    *  matching a remote peer's input stream to a body. */
   readonly slot: number;
 
+  /**
+   * Whether this slot is driven by a bot rather than from outside.
+   *
+   * Fixed at world construction and identical on every peer, so reading it is
+   * deterministic. Bots need it to elect a rescuer among themselves: a bot
+   * cannot defer to a human, because a human may simply never press the
+   * button, and the downed player then bleeds out while everyone waits.
+   */
+  readonly botControlled: boolean;
+
   // --- §8 death state ------------------------------------------------------
 
   life: LifeState = LifeState.Alive;
@@ -56,9 +66,10 @@ export class Player extends Entity {
   /** True for one tick on the Alive → Downed transition. */
   downedThisTick = false;
 
-  constructor(id: number, slot: number, x: number, y: number) {
+  constructor(id: number, slot: number, x: number, y: number, botControlled: boolean) {
     super(id, x, y, PLAYER.RADIUS, PLAYER.MAX_HP);
     this.slot = slot;
+    this.botControlled = botControlled;
   }
 
   /** Wraiths pass through everything — they cannot be hurt or blocked. */
