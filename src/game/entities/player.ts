@@ -30,8 +30,13 @@ export class Player extends Entity {
   /** Set for one tick when a swing lands — the renderer draws the arc. */
   attackedThisTick = false;
 
-  constructor(id: number, x: number, y: number) {
+  /** Party slot 0..3. Stable identity for colours, HUD, and later for
+   *  matching a remote peer's input stream to a body. */
+  readonly slot: number;
+
+  constructor(id: number, slot: number, x: number, y: number) {
     super(id, x, y, PLAYER.RADIUS, PLAYER.MAX_HP);
+    this.slot = slot;
   }
 
   step(dt: number, input: InputState, enemies: readonly Entity[]): void {

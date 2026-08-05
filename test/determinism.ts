@@ -11,7 +11,7 @@
  */
 
 import { Hasher } from '../src/core/checksum';
-import { SIM } from '../src/core/constants';
+import { PLAYER, ROOM, SIM } from '../src/core/constants';
 import { FixedLoop } from '../src/core/fixed-loop';
 import { Rng } from '../src/core/rng';
 import { World } from '../src/game/world';
@@ -78,11 +78,13 @@ export function makeInputScript(seed: string, ticks: number): InputState[] {
 
 const NEUTRAL = makeInputState();
 
-/** Step a world straight through a script, one tick per entry. */
-function runDirect(seed: string, script: readonly InputState[]): World {
-  const world = new World(seed);
+/** Step a world straight through a script, one tick per entry. The three bot
+ *  slots drive themselves inside the step. */
+function runDirect(seed: string, script: readonly InputState[], humanSlots = 1): World {
+  const world = new World(seed, humanSlots);
   for (let t = 0; t < script.length; t++) {
-    world.step(SIM.STEP_SECONDS, script[t] ?? NEUTRAL);
+    world.setInput(0, script[t] ?? NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
   }
   return world;
 }
@@ -111,7 +113,8 @@ function runThroughLoop(
     // sail straight through this check.
     loop.advance(delta, (dt) => {
       if (world.tick >= targetTicks) return; // ignore overshoot past the target
-      world.step(dt, script[world.tick] ?? NEUTRAL);
+      world.setInput(0, script[world.tick] ?? NEUTRAL);
+      world.step(dt);
     });
     frame++;
   }
@@ -125,7 +128,8 @@ function traceChecksums(seed: string, script: readonly InputState[]): string[] {
   const world = new World(seed);
   const trace: string[] = [];
   for (let t = 0; t < script.length; t++) {
-    world.step(SIM.STEP_SECONDS, script[t] ?? NEUTRAL);
+    world.setInput(0, script[t] ?? NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
     trace.push(world.checksum());
   }
   return trace;
@@ -285,7 +289,7 @@ export function checkChecksumSensitivity(): CheckResult {
   const world = runDirect('run-seed', script);
   const before = world.checksum();
 
-  world.player.x = nextAfter(world.player.x);
+  world.localPlayer.x = nextAfter(world.localPlayer.x);
   const afterPosition = world.checksum();
 
   const restored = runDirect('run-seed', script);
@@ -317,6 +321,91 @@ export function checkHasherStability(): CheckResult {
   };
 }
 
+export function checkBotDeterminism(): CheckResult {
+  // Bots are simulation code now. If a bot decision depended on wall time,
+  // Math.random, or iteration order, this is where it shows.
+  const script = makeInputScript('script-f', TICKS);
+  const a = runDirect('bot-seed', script);
+  const b = runDirect('bot-seed', script);
+
+  if (a.checksum() !== b.checksum()) {
+    return {
+      name: 'bot party replays identically',
+      pass: false,
+      detail: `${a.checksum()} vs ${b.checksum()} after ${TICKS} ticks`,
+    };
+  }
+
+  // And the bots must actually have done something — a party of statues
+  // would pass every determinism check ever written.
+  let moved = 0;
+  for (let i = 1; i < a.party.length; i++) {
+    const player = a.party[i]!.player;
+    const spawnDrift = Math.hypot(player.x - ROOM.WIDTH / 2, player.y - ROOM.HEIGHT / 2);
+    if (spawnDrift > PLAYER.RADIUS * 6) moved++;
+  }
+
+  return {
+    name: 'bot party replays identically',
+    pass: moved > 0,
+    detail:
+      moved > 0
+        ? `3 bots, ${TICKS} ticks, identical ${a.checksum()} (${moved} left the spawn ring)`
+        : 'checksums match but no bot moved — the check is vacuous',
+  };
+}
+
+export function checkBotsDoNotDesyncOnFramerate(): CheckResult {
+  const script = makeInputScript('script-g', 900);
+  const reference = runDirect('bot-seed', script);
+  const stuttered = runThroughLoop('bot-seed', script, [8, 33.3, 4, 51, 16.7, 120, 2]);
+
+  return {
+    name: 'bot decisions are framerate-independent',
+    pass: reference.checksum() === stuttered.checksum(),
+    detail:
+      reference.checksum() === stuttered.checksum()
+        ? `steady and stuttering frames agree on ${reference.checksum()}`
+        : `${reference.checksum()} vs ${stuttered.checksum()}`,
+  };
+}
+
+export function checkBotsFightAndSeparate(): CheckResult {
+  // Behavioural, not determinism: bots that pile onto one pixel make §13's
+  // readability question unanswerable, and bots that never engage make the
+  // dummy irrelevant. Both are silent failures without a check.
+  const script = makeInputScript('script-h', 1200);
+  const world = runDirect('bot-seed', script);
+
+  let minPairDistance = Infinity;
+  const players = world.players;
+  for (let i = 0; i < players.length; i++) {
+    for (let j = i + 1; j < players.length; j++) {
+      minPairDistance = Math.min(minPairDistance, Math.hypot(
+        players[i]!.x - players[j]!.x,
+        players[i]!.y - players[j]!.y,
+      ));
+    }
+  }
+
+  // Dummies respawn, so "did they fight" means "is at least one damaged or
+  // recently killed", not "are they all dead".
+  let engaged = false;
+  for (const dummy of world.dummies) {
+    if (dummy.hp < dummy.maxHp || !dummy.alive) engaged = true;
+  }
+
+  const separated = minPairDistance > PLAYER.RADIUS * 2;
+
+  return {
+    name: 'bots engage and stay separated',
+    pass: separated && engaged,
+    detail: separated && engaged
+      ? `closest pair ${minPairDistance.toFixed(0)}u apart, dummies taking damage`
+      : `separated: ${separated} (closest ${minPairDistance.toFixed(0)}u), engaged: ${engaged}`,
+  };
+}
+
 /** Smallest representable increase — one unit in the last place. */
 function nextAfter(value: number): number {
   const buf = new DataView(new ArrayBuffer(8));
@@ -338,6 +427,9 @@ export const CHECKS = [
   checkRngContract,
   checkChecksumSensitivity,
   checkHasherStability,
+  checkBotDeterminism,
+  checkBotsDoNotDesyncOnFramerate,
+  checkBotsFightAndSeparate,
 ] as const;
 
 export function runAll(): CheckResult[] {

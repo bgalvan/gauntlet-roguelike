@@ -72,6 +72,27 @@ export function makeInputState(): InputState {
   };
 }
 
+/** Copy without reallocating. Used to hand a controller's input to the sim. */
+export function copyInputState(src: InputState, dst: InputState): void {
+  dst.moveVector.x = src.moveVector.x;
+  dst.moveVector.y = src.moveVector.y;
+  dst.targetOverride.active = src.targetOverride.active;
+  dst.targetOverride.direction.x = src.targetOverride.direction.x;
+  dst.targetOverride.direction.y = src.targetOverride.direction.y;
+  copyButton(src.ability[0], dst.ability[0]);
+  copyButton(src.ability[1], dst.ability[1]);
+  copyButton(src.ability[2], dst.ability[2]);
+  copyButton(src.contextAction, dst.contextAction);
+  copyButton(src.activeItem, dst.activeItem);
+}
+
+function copyButton(src: ButtonState, dst: ButtonState): void {
+  dst.down = src.down;
+  dst.pressed = src.pressed;
+  dst.released = src.released;
+  dst.value = src.value;
+}
+
 /** Reset to neutral without reallocating — the sim reads this every tick. */
 export function clearInputState(s: InputState): void {
   s.moveVector.x = 0;

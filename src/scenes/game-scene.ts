@@ -1,6 +1,6 @@
 import Phaser from 'phaser';
 
-import { PLAYER, ROOM, SIM } from '../core/constants';
+import { PARTY_SIZE, PLAYER, ROOM, SIM } from '../core/constants';
 import { FixedLoop } from '../core/fixed-loop';
 import { InputManager } from '../input/input-manager';
 import { GamepadBackend } from '../input/backends/gamepad';
@@ -8,6 +8,13 @@ import { KeyboardMouseBackend } from '../input/backends/keyboard-mouse';
 import type { Vec2 } from '../input/input-state';
 import { World } from '../game/world';
 import type { Entity } from '../game/entities/entity';
+import type { Player } from '../game/entities/player';
+
+/** Per-slot colours. Slot 0 is the local player. */
+const SLOT_COLOR = [0x4f9dff, 0xff7a59, 0x6fd08c, 0xc98bff] as const;
+const SLOT_RIM = [0xa8d0ff, 0xffc0ad, 0xb8ecc8, 0xe2c6ff] as const;
+
+const FLASH_SECONDS = 0.12;
 
 /**
  * The only Phaser-aware file in the project besides main.ts.
@@ -26,10 +33,10 @@ export class GameScene extends Phaser.Scene {
   private gfx!: Phaser.GameObjects.Graphics;
   private hud!: Phaser.GameObjects.Text;
 
-  /** Seconds left on the swing flash. Render-only state. */
-  private attackFlash = 0;
-  private attackTargetX = 0;
-  private attackTargetY = 0;
+  /** Swing flash per party slot. Render-only state. */
+  private readonly flashTimer = new Float32Array(PARTY_SIZE);
+  private readonly flashX = new Float32Array(PARTY_SIZE);
+  private readonly flashY = new Float32Array(PARTY_SIZE);
 
   constructor() {
     super('game');
@@ -38,13 +45,13 @@ export class GameScene extends Phaser.Scene {
   create(): void {
     // A run is reproducible from this string. Phase 1 will read it from the
     // URL; for now it is fixed so two launches are visibly identical.
-    this.world = new World('phase-0');
+    // One human slot, three bots — bots are how co-op gets tested solo
+    // (CLAUDE.md conventions).
+    this.world = new World('phase-0', 1);
     this.loop = new FixedLoop();
 
     this.kbm = new KeyboardMouseBackend(this.game.canvas, this.playerScreenPosition);
-    this.input$ = new InputManager()
-      .add(this.kbm)
-      .add(new GamepadBackend());
+    this.input$ = new InputManager().add(this.kbm).add(new GamepadBackend());
 
     this.gfx = this.add.graphics();
     this.hud = this.add
@@ -65,20 +72,26 @@ export class GameScene extends Phaser.Scene {
     this.loop.advance(delta, (dt) => {
       // Input is sampled once per *simulation* step, not per frame. This is
       // the per-tick input frame lockstep will serialize later.
-      const state = this.input$.sample();
-      this.world.step(dt, state);
+      this.world.setInput(0, this.input$.sample());
+      this.world.step(dt);
 
-      if (this.world.player.attackedThisTick) {
-        this.attackFlash = 0.12;
-        const target = this.world.player.target;
+      const party = this.world.party;
+      for (let i = 0; i < party.length; i++) {
+        const player = party[i]!.player;
+        if (!player.attackedThisTick) continue;
+        this.flashTimer[i] = FLASH_SECONDS;
+        const target = player.target;
         if (target) {
-          this.attackTargetX = target.x;
-          this.attackTargetY = target.y;
+          this.flashX[i] = target.x;
+          this.flashY[i] = target.y;
         }
       }
     });
 
-    if (this.attackFlash > 0) this.attackFlash -= delta / 1000;
+    const decay = delta / 1000;
+    for (let i = 0; i < this.flashTimer.length; i++) {
+      if (this.flashTimer[i]! > 0) this.flashTimer[i] = this.flashTimer[i]! - decay;
+    }
 
     this.draw(this.loop.alpha);
     this.drawHud();
@@ -107,30 +120,58 @@ export class GameScene extends Phaser.Scene {
       this.drawHealthBar(g, x, y - dummy.radius - 12, dummy.hp / dummy.maxHp);
     }
 
-    const player = this.world.player;
-    const px = lerp(player.prevX, player.x, alpha);
-    const py = lerp(player.prevY, player.y, alpha);
+    const party = this.world.party;
 
-    this.drawTargetMarker(g, player.target, alpha, player.overrideActive);
-
-    if (this.attackFlash > 0) {
-      const t = this.attackFlash / 0.12;
-      g.lineStyle(3, 0xffe9a8, t)
+    // Swing lines under the bodies, so four overlapping attacks don't bury
+    // the players themselves — this is §13 question 3 in miniature.
+    for (let i = 0; i < party.length; i++) {
+      const timer = this.flashTimer[i]!;
+      if (timer <= 0) continue;
+      const player = party[i]!.player;
+      const px = lerp(player.prevX, player.x, alpha);
+      const py = lerp(player.prevY, player.y, alpha);
+      g.lineStyle(3, SLOT_RIM[player.slot % SLOT_RIM.length]!, timer / FLASH_SECONDS)
         .beginPath()
         .moveTo(px, py)
-        .lineTo(this.attackTargetX, this.attackTargetY)
+        .lineTo(this.flashX[i]!, this.flashY[i]!)
         .strokePath();
     }
 
-    // Attack reach — Phase 0 needs the auto-target rule to be legible.
-    g.lineStyle(1, 0x3a4557, 0.6).strokeCircle(px, py, PLAYER.ATTACK_RANGE);
+    for (let i = 0; i < party.length; i++) {
+      const slot = party[i]!;
+      this.drawPlayer(g, slot.player, alpha, slot.controller.kind === 'bot');
+    }
+  }
 
-    g.fillStyle(0x4f9dff, 1).fillCircle(px, py, player.radius);
-    g.lineStyle(2, 0xa8d0ff, 1).strokeCircle(px, py, player.radius);
-    // Facing pip.
+  private drawPlayer(
+    g: Phaser.GameObjects.Graphics,
+    player: Player,
+    alpha: number,
+    isBot: boolean,
+  ): void {
+    const x = lerp(player.prevX, player.x, alpha);
+    const y = lerp(player.prevY, player.y, alpha);
+    const fill = SLOT_COLOR[player.slot % SLOT_COLOR.length]!;
+    const rim = SLOT_RIM[player.slot % SLOT_RIM.length]!;
+
+    this.drawTargetMarker(g, player.target, alpha, player.overrideActive);
+
+    // Attack reach for the local player only — four range circles is noise.
+    if (!isBot) {
+      g.lineStyle(1, 0x3a4557, 0.6).strokeCircle(x, y, PLAYER.ATTACK_RANGE);
+    }
+
+    g.fillStyle(fill, 1).fillCircle(x, y, player.radius);
+    g.lineStyle(2, rim, 1).strokeCircle(x, y, player.radius);
+
+    // Bots read as hollow, so it's never ambiguous which body is yours.
+    if (isBot) {
+      g.fillStyle(0x14161d, 1).fillCircle(x, y, player.radius * 0.45);
+    }
+
     g.fillStyle(0xffffff, 1).fillCircle(
-      px + player.facingX * player.radius,
-      py + player.facingY * player.radius,
+      x + player.facingX * player.radius,
+      y + player.facingY * player.radius,
       4,
     );
   }
@@ -162,7 +203,11 @@ export class GameScene extends Phaser.Scene {
     const y = lerp(target.prevY, target.y, alpha);
     // Amber when the player overrode the auto-pick, so the distinction the
     // manual cares about (§16.5b) is visible on screen.
-    g.lineStyle(2, overridden ? 0xffb347 : 0x6fd08c, 1).strokeCircle(x, y, target.radius + 7);
+    g.lineStyle(2, overridden ? 0xffb347 : 0x6fd08c, overridden ? 1 : 0.35).strokeCircle(
+      x,
+      y,
+      target.radius + 7,
+    );
   }
 
   private drawHealthBar(
@@ -179,15 +224,16 @@ export class GameScene extends Phaser.Scene {
 
   private drawHud(): void {
     const s = this.input$.current;
-    const player = this.world.player;
+    const player = this.world.localPlayer;
+    const bots = this.world.party.filter((slot) => slot.controller.kind === 'bot').length;
+
     this.hud.setText([
-      `seed ${String(this.world.seed)}   tick ${this.world.tick}   rng ${this.world.rng
-        .getState()
-        .toString(16)}`,
+      `seed ${String(this.world.seed)}   tick ${this.world.tick}   checksum ${this.world.checksum()}`,
       `sim ${SIM.TICK_RATE}Hz fixed   render ${Math.round(this.game.loop.actualFps)}fps   alpha ${this.loop.alpha.toFixed(2)}`,
-      `input ${this.input$.activeBackendId ?? '—'}   move ${s.moveVector.x.toFixed(2)},${s.moveVector.y.toFixed(2)}   override ${player.overrideActive ? 'ON' : 'off'}`,
+      `party ${this.world.party.length} (1 human + ${bots} bots)   input ${this.input$.activeBackendId ?? '—'}`,
+      `move ${s.moveVector.x.toFixed(2)},${s.moveVector.y.toFixed(2)}   override ${player.overrideActive ? 'ON' : 'off'}`,
       `slots [${s.ability[0].down ? '1' : '·'}${s.ability[1].down ? '2' : '·'}${s.ability[2].down ? '3' : '·'}] ctx ${s.contextAction.down ? 'E' : '·'} item ${s.activeItem.down ? 'Q' : '·'}   (unbound in Phase 0)`,
-      `WASD move · mouse/RS override · auto-attack`,
+      `WASD move · mouse/RS override · auto-attack · you are the filled blue circle`,
     ]);
   }
 
@@ -202,9 +248,10 @@ export class GameScene extends Phaser.Scene {
     if (!this.world) return null;
     const rect = this.game.canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return null;
+    const player = this.world.localPlayer;
     return {
-      x: rect.left + (this.world.player.x / ROOM.WIDTH) * rect.width,
-      y: rect.top + (this.world.player.y / ROOM.HEIGHT) * rect.height,
+      x: rect.left + (player.x / ROOM.WIDTH) * rect.width,
+      y: rect.top + (player.y / ROOM.HEIGHT) * rect.height,
     };
   };
 }
