@@ -34,6 +34,11 @@ export abstract class Entity {
     this.maxHp = maxHp;
   }
 
+  /** Whether this body participates in collision. Wraiths (§8) do not. */
+  get collides(): boolean {
+    return this.alive;
+  }
+
   /** Call at the top of every sim step, before any movement. */
   snapshot(): void {
     this.prevX = this.x;

@@ -1,5 +1,5 @@
 # DESIGN MANUAL — Untitled Co-op Roguelike
-**Version 0.11 · Last updated 2026-08-04**
+**Version 0.12 · Last updated 2026-08-04**
 
 > **STATUS: CANONICAL.** This document supersedes `coop-roguelike-spec.md` (v0.1) and `coop-roguelike-loot-and-party-items.md`. Both are archived; their content is folded in below. This is the single source of truth.
 
@@ -667,6 +667,14 @@ Ranked by actual impact:
 ---
 
 ## 18. CHANGELOG
+
+**v0.12 — 2026-08-04**
+- Phase 0 skeleton built: fixed-timestep loop, input abstraction (M+K and gamepad per §16.0), seeded PRNG, one room. Determinism harness and desync checksums added alongside, since §16.3 lockstep depends on both.
+- Bot party built (four slots, three bots by default) per §17.3. Bots produce `InputState` like any human, so they exercise the real code path and need no separate AI plumbing. Bot behaviour is a pure function of world state plus a forked PRNG, so lockstep peers derive it independently — **bot inputs never need to go over the wire.**
+- Phase 1 combat foundation: body collision, an Act I melee enemy with a telegraphed wind-up (Pillar 3 — an instant hit is unreadable at scale), waves scaled by §2's party curve, and §8 death stages 1–2.
+- **§8 implementation decisions taken, flagged for review:** enemies ignore Downed players (§8's own death-spiral rule — it also stops reviving being a trap); wave size scales by party *size*, never living players (same rule); a revive interrupt resets the channel to zero rather than decaying it, making the 3s a real commitment. All `[DEFAULT]` — overrule freely.
+- **Measured, not designed:** with an idle human and three bots, the party wipes in ~72s after two waves, with 16 downs and 12 revives. Combat is lethal. Real balance is deferred — there are no items, upgrades, or healing economy yet to balance against.
+- §8 stage 3 (resurrection) remains unbuilt; it needs bosses and shops.
 
 **v0.11 — 2026-08-04**
 - **Platform decision `[LOCKED]`:** mouse+keyboard and gamepad, web build, desktop-first. Mobile deferred, not cancelled.

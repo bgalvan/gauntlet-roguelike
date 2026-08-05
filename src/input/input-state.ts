@@ -15,15 +15,23 @@ export interface Vec2 {
   y: number;
 }
 
-/** Ability slots, per manual §16.0. */
-export const enum AbilitySlot {
+/**
+ * Ability slots, per manual §16.0.
+ *
+ * A const object rather than a `const enum` — const enums depend on the
+ * bundler inlining them across module boundaries, which is a silent
+ * correctness hazard when the toolchain changes.
+ */
+export const AbilitySlot = {
   /** Slot 1 — Traversal. Space / A. */
-  Traversal = 0,
+  Traversal: 0,
   /** Slot 2 — Signature. RMB / RT. Analog: supports held abilities. */
-  Signature = 1,
+  Signature: 1,
   /** Slot 3 — Payoff. Shift / RB. */
-  Payoff = 2,
-}
+  Payoff: 2,
+} as const;
+
+export type AbilitySlot = (typeof AbilitySlot)[keyof typeof AbilitySlot];
 
 /** Per-button state. `pressed`/`released` are true only on the tick of the edge. */
 export interface ButtonState {

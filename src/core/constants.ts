@@ -34,6 +34,15 @@ export const ROOM = {
 /** Party size. Four is the design target (§2) and what §13's questions need. */
 export const PARTY_SIZE = 4;
 
+export const COLLISION = {
+  /** Relaxation passes per tick. One pass leaves residual overlap in a pile;
+   *  two is enough at these entity counts and stays cheap. */
+  ITERATIONS: 2,
+  /** Fraction of the overlap resolved per pass. Below 1 so bodies settle
+   *  instead of jittering against each other. */
+  STIFFNESS: 0.6,
+} as const;
+
 export const PLAYER = {
   RADIUS: 16,
   /** World units per second. */
@@ -46,11 +55,78 @@ export const PLAYER = {
   ATTACK_DAMAGE: 7,
 } as const;
 
-export const DUMMY = {
-  RADIUS: 18,
-  MAX_HP: 60,
-  /** Seconds a destroyed dummy stays down before it resets, so testing continues. */
-  RESPAWN_DELAY: 2.0,
+/**
+ * Act I "Crypt" melee enemy — the teaching enemy (§2). One archetype is
+ * enough to make combat real; the roster is content work, not engineering.
+ */
+export const ENEMY = {
+  RADIUS: 14,
+  MOVE_SPEED: 132,
+  MAX_HP: 30,
+  DAMAGE: 8,
+
+  /** Centre-to-centre reach for its swing. */
+  ATTACK_RANGE: 38,
+  /** Telegraph. Pillar 3 (readable chaos) needs a wind-up you can react to —
+   *  an instant hit is unreadable once there are forty of them. */
+  WINDUP: 0.35,
+  /** Seconds between swings. */
+  ATTACK_INTERVAL: 1.1,
+
+  /** Enemies stop closing once this near, so they surround rather than stack. */
+  PREFERRED_GAP: 4,
+} as const;
+
+/**
+ * Wave budget. §2 party scaling: 100 / 165 / 220 / 270% for 1–4 players.
+ *
+ * Scaled by **party size, not living players** — deliberately. §8's design
+ * rule: anything that scales with living players is a death spiral, weakest
+ * exactly when you're already losing.
+ */
+export const WAVE = {
+  BASE_COUNT: 8,
+  PARTY_SCALING: [1.0, 1.65, 2.2, 2.7],
+  /** Seconds after a wave is cleared before the next spawns. */
+  RESPAWN_DELAY: 3.0,
+
+  /**
+   * Fraction of max HP restored to living players when a wave is cleared.
+   *
+   * SANDBOX SCAFFOLDING, not a design decision. Nothing in the game heals yet
+   * — no pickups, no shop, no items — so continuous waves guarantee a wipe by
+   * attrition regardless of play. Measured: without this the party wipes in
+   * ~46s having cleared one wave. This stands in for §2's room-clear rewards
+   * until those exist, and should be deleted when they do. Real healing
+   * economy is Bobby's call.
+   */
+  CLEAR_HEAL: 0.35,
+  /** Enemies spawn at least this far from any player. */
+  SAFE_SPAWN_DISTANCE: 260,
+} as const;
+
+/**
+ * Death system — §8, `[LOCKED]` direction, `[DEFAULT]` implementation.
+ *
+ * Stage 3 (resurrection at a boss, shop shrine, or via a revive item) needs
+ * bosses and shops, so it is not built yet.
+ */
+export const DEATH = {
+  /** Stage 1 — Downed: crawling, cannot attack, bleeds out. */
+  BLEED_OUT: 20.0,
+  CRAWL_SPEED: 88,
+
+  /** Any ally revives with a 3s channel. Free. */
+  REVIVE_CHANNEL: 3.0,
+  REVIVE_RANGE: 62,
+  /** HP a revived player stands up with. */
+  REVIVE_HP: 35,
+
+  /** Stage 2 — Wraith: moves freely, cannot be hurt, one weak utility. */
+  WRAITH_SPEED: 300,
+  /** The Wraith's utility: enemies inside this radius are slowed. */
+  WRAITH_SLOW_RADIUS: 150,
+  WRAITH_SLOW_FACTOR: 0.55,
 } as const;
 
 /**
@@ -80,6 +156,19 @@ export const BOT = {
   /** Seeded wobble, so four bots don't move as one rigid body. */
   JITTER: 0.16,
   JITTER_INTERVAL_TICKS: 24,
+
+  /**
+   * Below this fraction of max HP a bot disengages and kites. Without it bots
+   * stand in a swarm trading hits until they drop — which measures nothing
+   * except that bots are bad, and makes the sandbox unplayable long before
+   * any design question can be asked.
+   */
+  RETREAT_HP: 0.4,
+  /** Re-engage above this. The gap is hysteresis — a single threshold makes
+   *  bots oscillate on the boundary. */
+  REENGAGE_HP: 0.7,
+  /** How far a retreating bot wants to be from the nearest enemy. */
+  RETREAT_DISTANCE: 260,
 } as const;
 
 /**

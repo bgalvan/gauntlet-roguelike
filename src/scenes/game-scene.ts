@@ -1,20 +1,24 @@
 import Phaser from 'phaser';
 
-import { PARTY_SIZE, PLAYER, ROOM, SIM } from '../core/constants';
+import { DEATH, ENEMY, PARTY_SIZE, PLAYER, ROOM, SIM } from '../core/constants';
 import { FixedLoop } from '../core/fixed-loop';
 import { InputManager } from '../input/input-manager';
 import { GamepadBackend } from '../input/backends/gamepad';
 import { KeyboardMouseBackend } from '../input/backends/keyboard-mouse';
 import type { Vec2 } from '../input/input-state';
 import { World } from '../game/world';
+import type { Enemy } from '../game/entities/enemy';
 import type { Entity } from '../game/entities/entity';
 import type { Player } from '../game/entities/player';
+import { LifeState, lifeStateName } from '../game/life-state';
 
 /** Per-slot colours. Slot 0 is the local player. */
 const SLOT_COLOR = [0x4f9dff, 0xff7a59, 0x6fd08c, 0xc98bff] as const;
 const SLOT_RIM = [0xa8d0ff, 0xffc0ad, 0xb8ecc8, 0xe2c6ff] as const;
 
 const FLASH_SECONDS = 0.12;
+/** Seconds the wipe banner shows before the sandbox restarts itself. */
+const RESTART_DELAY = 4;
 
 /**
  * The only Phaser-aware file in the project besides main.ts.
@@ -32,22 +36,23 @@ export class GameScene extends Phaser.Scene {
 
   private gfx!: Phaser.GameObjects.Graphics;
   private hud!: Phaser.GameObjects.Text;
+  private banner!: Phaser.GameObjects.Text;
 
   /** Swing flash per party slot. Render-only state. */
   private readonly flashTimer = new Float32Array(PARTY_SIZE);
   private readonly flashX = new Float32Array(PARTY_SIZE);
   private readonly flashY = new Float32Array(PARTY_SIZE);
 
+  /** Sandbox restart bookkeeping — not a game mechanic. */
+  private restartTimer = 0;
+  private generation = 0;
+
   constructor() {
     super('game');
   }
 
   create(): void {
-    // A run is reproducible from this string. Phase 1 will read it from the
-    // URL; for now it is fixed so two launches are visibly identical.
-    // One human slot, three bots — bots are how co-op gets tested solo
-    // (CLAUDE.md conventions).
-    this.world = new World('phase-0', 1);
+    this.newRun();
     this.loop = new FixedLoop();
 
     this.kbm = new KeyboardMouseBackend(this.game.canvas, this.playerScreenPosition);
@@ -63,7 +68,30 @@ export class GameScene extends Phaser.Scene {
       })
       .setDepth(10);
 
+    this.banner = this.add
+      .text(ROOM.WIDTH / 2, ROOM.HEIGHT / 2, '', {
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: '34px',
+        color: '#ff8080',
+        align: 'center',
+      })
+      .setOrigin(0.5)
+      .setDepth(20);
+
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.input$.destroy());
+  }
+
+  /**
+   * A run is reproducible from its seed. Phase 1 will read the base seed from
+   * the URL; the generation suffix only exists so the sandbox can restart
+   * itself after a wipe without repeating the identical run.
+   */
+  private newRun(): void {
+    // One human slot, three bots — bots are how co-op gets tested solo
+    // (CLAUDE.md conventions).
+    this.world = new World(`phase-1#${this.generation}`, 1);
+    this.restartTimer = 0;
+    this.flashTimer.fill(0);
   }
 
   override update(time: number, delta: number): void {
@@ -93,6 +121,17 @@ export class GameScene extends Phaser.Scene {
       if (this.flashTimer[i]! > 0) this.flashTimer[i] = this.flashTimer[i]! - decay;
     }
 
+    if (this.world.runOver) {
+      this.restartTimer += decay;
+      this.banner.setText(`PARTY WIPED\nwaves cleared ${this.world.wavesCleared}`);
+      if (this.restartTimer >= RESTART_DELAY) {
+        this.generation++;
+        this.newRun();
+      }
+    } else {
+      this.banner.setText('');
+    }
+
     this.draw(this.loop.alpha);
     this.drawHud();
   }
@@ -105,19 +144,8 @@ export class GameScene extends Phaser.Scene {
 
     this.drawRoom(g);
 
-    for (const dummy of this.world.dummies) {
-      const x = lerp(dummy.prevX, dummy.x, alpha);
-      const y = lerp(dummy.prevY, dummy.y, alpha);
-
-      if (!dummy.alive) {
-        g.fillStyle(0x2a2f3a, 1).fillCircle(x, y, dummy.radius * 0.6);
-        continue;
-      }
-
-      const body = dummy.hitFlashTicks > 0 ? 0xf0e6d2 : 0x8a7f6b;
-      g.fillStyle(body, 1).fillCircle(x, y, dummy.radius);
-      g.lineStyle(2, 0x5a5245, 1).strokeCircle(x, y, dummy.radius);
-      this.drawHealthBar(g, x, y - dummy.radius - 12, dummy.hp / dummy.maxHp);
+    for (const enemy of this.world.enemies) {
+      this.drawEnemy(g, enemy, alpha);
     }
 
     const party = this.world.party;
@@ -143,6 +171,36 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  private drawEnemy(g: Phaser.GameObjects.Graphics, enemy: Enemy, alpha: number): void {
+    const x = lerp(enemy.prevX, enemy.x, alpha);
+    const y = lerp(enemy.prevY, enemy.y, alpha);
+
+    if (!enemy.alive) {
+      g.fillStyle(0x24242c, 1).fillCircle(x, y, enemy.radius * 0.5);
+      return;
+    }
+
+    // The telegraph, drawn as a filling ring. Pillar 3: an attack you cannot
+    // see coming is an attack you cannot read, and this is the whole reason
+    // the wind-up exists.
+    if (enemy.isWindingUp) {
+      const p = enemy.windupProgress;
+      g.lineStyle(3, 0xff5555, 0.35 + p * 0.65).strokeCircle(
+        x,
+        y,
+        ENEMY.ATTACK_RANGE * (0.55 + p * 0.45),
+      );
+    }
+
+    const body = enemy.hitFlashTicks > 0 ? 0xffd9d9 : 0x9c5f5f;
+    g.fillStyle(body, 1).fillCircle(x, y, enemy.radius);
+    g.lineStyle(2, 0x6b3d3d, 1).strokeCircle(x, y, enemy.radius);
+
+    if (enemy.hp < enemy.maxHp) {
+      this.drawBar(g, x, y - enemy.radius - 10, 30, enemy.hp / enemy.maxHp, 0xd05a5a);
+    }
+  }
+
   private drawPlayer(
     g: Phaser.GameObjects.Graphics,
     player: Player,
@@ -153,6 +211,25 @@ export class GameScene extends Phaser.Scene {
     const y = lerp(player.prevY, player.y, alpha);
     const fill = SLOT_COLOR[player.slot % SLOT_COLOR.length]!;
     const rim = SLOT_RIM[player.slot % SLOT_RIM.length]!;
+
+    if (player.life === LifeState.Wraith) {
+      // Ghosted outline: present, unhittable, still doing something.
+      g.lineStyle(2, rim, 0.5).strokeCircle(x, y, player.radius);
+      g.lineStyle(1, rim, 0.16).strokeCircle(x, y, DEATH.WRAITH_SLOW_RADIUS);
+      return;
+    }
+
+    if (player.life === LifeState.Downed) {
+      g.fillStyle(fill, 0.35).fillCircle(x, y, player.radius * 0.8);
+      g.lineStyle(2, 0xff6b6b, 1).strokeCircle(x, y, player.radius * 0.8);
+      // Bleed-out clock, then revive progress over the top of it.
+      this.drawBar(g, x, y - player.radius - 14, 46, player.bleedOutRemaining, 0xff6b6b);
+      if (player.reviveProgress > 0) {
+        this.drawBar(g, x, y - player.radius - 22, 46, player.reviveProgress, 0x6fd08c);
+      }
+      g.lineStyle(1, 0x6fd08c, 0.3).strokeCircle(x, y, DEATH.REVIVE_RANGE);
+      return;
+    }
 
     this.drawTargetMarker(g, player.target, alpha, player.overrideActive);
 
@@ -174,6 +251,8 @@ export class GameScene extends Phaser.Scene {
       y + player.facingY * player.radius,
       4,
     );
+
+    this.drawBar(g, x, y - player.radius - 12, 40, player.hp / player.maxHp, 0x6fd08c);
   }
 
   private drawRoom(g: Phaser.GameObjects.Graphics): void {
@@ -210,30 +289,40 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
-  private drawHealthBar(
+  private drawBar(
     g: Phaser.GameObjects.Graphics,
     x: number,
     y: number,
+    width: number,
     fraction: number,
+    color: number,
   ): void {
-    const width = 44;
     const height = 5;
+    const clamped = Math.max(0, Math.min(1, fraction));
     g.fillStyle(0x000000, 0.5).fillRect(x - width / 2, y, width, height);
-    g.fillStyle(0xd05a5a, 1).fillRect(x - width / 2, y, width * fraction, height);
+    g.fillStyle(color, 1).fillRect(x - width / 2, y, width * clamped, height);
   }
 
   private drawHud(): void {
     const s = this.input$.current;
-    const player = this.world.localPlayer;
-    const bots = this.world.party.filter((slot) => slot.controller.kind === 'bot').length;
+    const world = this.world;
+    const local = world.localPlayer;
+
+    const party = world.party
+      .map((slot) => {
+        const p = slot.player;
+        const tag = slot.controller.kind === 'bot' ? 'bot' : 'you';
+        return `${tag}${p.slot}:${lifeStateName(p.life)}`;
+      })
+      .join(' ');
 
     this.hud.setText([
-      `seed ${String(this.world.seed)}   tick ${this.world.tick}   checksum ${this.world.checksum()}`,
+      `seed ${String(world.seed)}   tick ${world.tick}   checksum ${world.checksum()}`,
       `sim ${SIM.TICK_RATE}Hz fixed   render ${Math.round(this.game.loop.actualFps)}fps   alpha ${this.loop.alpha.toFixed(2)}`,
-      `party ${this.world.party.length} (1 human + ${bots} bots)   input ${this.input$.activeBackendId ?? '—'}`,
-      `move ${s.moveVector.x.toFixed(2)},${s.moveVector.y.toFixed(2)}   override ${player.overrideActive ? 'ON' : 'off'}`,
-      `slots [${s.ability[0].down ? '1' : '·'}${s.ability[1].down ? '2' : '·'}${s.ability[2].down ? '3' : '·'}] ctx ${s.contextAction.down ? 'E' : '·'} item ${s.activeItem.down ? 'Q' : '·'}   (unbound in Phase 0)`,
-      `WASD move · mouse/RS override · auto-attack · you are the filled blue circle`,
+      `wave ${world.wavesCleared + 1}   enemies ${world.enemiesRemaining}/${world.enemies.length}   party ${party}`,
+      `input ${this.input$.activeBackendId ?? '—'}   move ${s.moveVector.x.toFixed(2)},${s.moveVector.y.toFixed(2)}   override ${local.overrideActive ? 'ON' : 'off'}`,
+      `slots [${s.ability[0].down ? '1' : '·'}${s.ability[1].down ? '2' : '·'}${s.ability[2].down ? '3' : '·'}] unbound   E/X = revive`,
+      `WASD move · mouse/RS override · auto-attack · hold E near a downed ally`,
     ]);
   }
 

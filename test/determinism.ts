@@ -11,9 +11,10 @@
  */
 
 import { Hasher } from '../src/core/checksum';
-import { PLAYER, ROOM, SIM } from '../src/core/constants';
+import { DEATH, ENEMY, PARTY_SIZE, PLAYER, ROOM, SIM } from '../src/core/constants';
 import { FixedLoop } from '../src/core/fixed-loop';
 import { Rng } from '../src/core/rng';
+import { LifeState, lifeStateName } from '../src/game/life-state';
 import { World } from '../src/game/world';
 import type { InputState } from '../src/input/input-state';
 import { clampToUnit, makeInputState } from '../src/input/input-state';
@@ -78,6 +79,29 @@ export function makeInputScript(seed: string, ticks: number): InputState[] {
 
 const NEUTRAL = makeInputState();
 
+/**
+ * Reads `life` through a call so TypeScript's control-flow narrowing resets.
+ * Stepping the world mutates the field, but the compiler cannot see that
+ * through a method call and would otherwise "prove" later comparisons dead.
+ */
+function lifeOf(p: { life: LifeState }): LifeState {
+  return p.life;
+}
+
+/**
+ * Clear the room for a focused mechanic check. Without this, a rescuer who
+ * stands still for a 3s channel is beaten down mid-channel and the check
+ * fails for a reason that has nothing to do with what it is testing.
+ *
+ * Call before every step — waves respawn on their own.
+ */
+function suppressEnemies(world: World): void {
+  for (const enemy of world.enemies) {
+    enemy.hp = 0;
+    enemy.alive = false;
+  }
+}
+
 /** Step a world straight through a script, one tick per entry. The three bot
  *  slots drive themselves inside the step. */
 function runDirect(seed: string, script: readonly InputState[], humanSlots = 1): World {
@@ -119,6 +143,23 @@ function runThroughLoop(
     frame++;
   }
 
+  return world;
+}
+
+/** Step a run, evaluating `probe` after every tick. Checking only the final
+ *  state misses anything transient — a pile that forms and clears, a body
+ *  shoved through a wall and pushed back. */
+function runWithProbe(
+  seed: string,
+  script: readonly InputState[],
+  probe: (world: World) => void,
+): World {
+  const world = new World(seed);
+  for (let t = 0; t < script.length; t++) {
+    world.setInput(0, script[t] ?? NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+    probe(world);
+  }
   return world;
 }
 
@@ -342,7 +383,7 @@ export function checkBotDeterminism(): CheckResult {
   for (let i = 1; i < a.party.length; i++) {
     const player = a.party[i]!.player;
     const spawnDrift = Math.hypot(player.x - ROOM.WIDTH / 2, player.y - ROOM.HEIGHT / 2);
-    if (spawnDrift > PLAYER.RADIUS * 6) moved++;
+    if (spawnDrift > PLAYER.RADIUS * 7) moved++;
   }
 
   return {
@@ -378,7 +419,7 @@ export function checkBotsFightAndSeparate(): CheckResult {
   const world = runDirect('bot-seed', script);
 
   let minPairDistance = Infinity;
-  const players = world.players;
+  const players = world.players.filter((p) => p.life !== LifeState.Wraith);
   for (let i = 0; i < players.length; i++) {
     for (let j = i + 1; j < players.length; j++) {
       minPairDistance = Math.min(minPairDistance, Math.hypot(
@@ -388,21 +429,270 @@ export function checkBotsFightAndSeparate(): CheckResult {
     }
   }
 
-  // Dummies respawn, so "did they fight" means "is at least one damaged or
-  // recently killed", not "are they all dead".
-  let engaged = false;
-  for (const dummy of world.dummies) {
-    if (dummy.hp < dummy.maxHp || !dummy.alive) engaged = true;
-  }
+  // Waves respawn, so "did they fight" means kills happened, not "is the
+  // room empty right now".
+  const engaged = world.wavesCleared > 0 || world.enemiesRemaining < world.enemies.length;
 
-  const separated = minPairDistance > PLAYER.RADIUS * 2;
+  // Collision keeps bodies from overlapping; steering keeps them from piling.
+  const separated = minPairDistance >= PLAYER.RADIUS * 2 - 1;
 
   return {
     name: 'bots engage and stay separated',
     pass: separated && engaged,
-    detail: separated && engaged
-      ? `closest pair ${minPairDistance.toFixed(0)}u apart, dummies taking damage`
-      : `separated: ${separated} (closest ${minPairDistance.toFixed(0)}u), engaged: ${engaged}`,
+    detail:
+      separated && engaged
+        ? `closest pair ${minPairDistance.toFixed(0)}u apart, ${world.wavesCleared} waves cleared`
+        : `separated: ${separated} (closest ${minPairDistance.toFixed(0)}u), engaged: ${engaged}`,
+  };
+}
+
+export function checkCollisionSeparatesBodies(): CheckResult {
+  // Collision is what stops twenty enemies occupying one pixel. Without it
+  // Pillar 3 is unreachable no matter how good the art is.
+  const script = makeInputScript('script-i', 900);
+
+  let worstOverlap = 0;
+  let worstPair = '';
+  let peakBodies = 0;
+
+  // Sampled every tick. The final tick is often a cleared room, which would
+  // make this check pass by having nothing to measure.
+  runWithProbe('combat-seed', script, (world) => {
+    const bodies = [
+      ...world.players.filter((p) => p.life !== LifeState.Wraith),
+      ...world.enemies.filter((e) => e.alive),
+    ];
+    peakBodies = Math.max(peakBodies, bodies.length);
+
+    for (let i = 0; i < bodies.length; i++) {
+      for (let j = i + 1; j < bodies.length; j++) {
+        const a = bodies[i]!;
+        const b = bodies[j]!;
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        const overlap = a.radius + b.radius - dist;
+        if (overlap > worstOverlap) {
+          worstOverlap = overlap;
+          worstPair = `#${a.id}/#${b.id}`;
+        }
+      }
+    }
+  });
+
+  // Positional relaxation leaves a little residual overlap by design — it is
+  // soft on purpose so bodies settle instead of jittering. A few units is
+  // healthy; half a body is not.
+  const tolerance = ENEMY.RADIUS * 0.6;
+
+  return {
+    name: 'collision keeps bodies apart',
+    pass: worstOverlap <= tolerance && peakBodies > PARTY_SIZE,
+    detail:
+      worstOverlap <= tolerance && peakBodies > PARTY_SIZE
+        ? `peak ${peakBodies} bodies over 900 ticks, worst overlap ${worstOverlap.toFixed(1)}u (tolerance ${tolerance.toFixed(1)}u)`
+        : `peak ${peakBodies} bodies; ${worstPair} overlap ${worstOverlap.toFixed(1)}u vs tolerance ${tolerance.toFixed(1)}u`,
+  };
+}
+
+export function checkNothingEscapesTheRoom(): CheckResult {
+  const script = makeInputScript('script-j', 900);
+  let escapee = '';
+  let checked = 0;
+
+  // Every tick: collision resolution runs after movement, so a body squeezed
+  // between a wall and a crowd is exactly the case that could pop through.
+  runWithProbe('combat-seed', script, (world) => {
+    if (escapee) return;
+    const bodies = [...world.players, ...world.enemies];
+    for (const b of bodies) {
+      checked++;
+      const minX = ROOM.WALL + b.radius;
+      const maxX = ROOM.WIDTH - ROOM.WALL - b.radius;
+      const minY = ROOM.WALL + b.radius;
+      const maxY = ROOM.HEIGHT - ROOM.WALL - b.radius;
+      if (b.x < minX - 0.001 || b.x > maxX + 0.001 || b.y < minY - 0.001 || b.y > maxY + 0.001) {
+        escapee = `entity #${b.id} at ${b.x.toFixed(1)},${b.y.toFixed(1)} on tick ${world.tick}`;
+        return;
+      }
+    }
+  });
+
+  return {
+    name: 'no body escapes the room',
+    pass: escapee === '',
+    detail: escapee === '' ? `${checked} body-ticks all inside the walls` : escapee,
+  };
+}
+
+export function checkDeathSystem(): CheckResult {
+  // §8 stage 1 → stage 2, driven directly rather than waiting for combat to
+  // produce it: the transitions must be exercised, not hoped for.
+  // All slots human and fed nothing. Bots would rescue the victim — correctly,
+  // as the bot-revive check below proves — which would make this check
+  // untestable rather than passing.
+  const world = new World('death-seed', PARTY_SIZE);
+  const victim = world.party[1]!.player;
+
+  victim.takeDamage(PLAYER.MAX_HP);
+  if (victim.life !== LifeState.Downed) {
+    return { name: '§8 death system', pass: false, detail: 'lethal damage did not down the player' };
+  }
+  if (!victim.alive) {
+    return {
+      name: '§8 death system',
+      pass: false,
+      detail: 'a downed player must still be a body allies can reach',
+    };
+  }
+
+  // Downed players cannot be hurt further — §8's anti-death-spiral rule.
+  const hpWhileDowned = victim.hp;
+  victim.takeDamage(50);
+  if (victim.hp !== hpWhileDowned || victim.life !== LifeState.Downed) {
+    return { name: '§8 death system', pass: false, detail: 'a downed player took further damage' };
+  }
+
+  // Bleed out to Wraith. No ally is channelling here because the other bots
+  // are elsewhere; step until the clock runs out.
+  const bleedTicks = Math.round(DEATH.BLEED_OUT * SIM.TICK_RATE);
+  for (let t = 0; t < bleedTicks + 5 && lifeOf(victim) === LifeState.Downed; t++) {
+    suppressEnemies(world);
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+  }
+  if (lifeOf(victim) !== LifeState.Wraith) {
+    return {
+      name: '§8 death system',
+      pass: false,
+      detail: `bleed-out did not reach Wraith (still ${lifeStateName(lifeOf(victim))})`,
+    };
+  }
+  if (victim.collides) {
+    return { name: '§8 death system', pass: false, detail: 'a Wraith must not collide' };
+  }
+
+  return {
+    name: '§8 death system',
+    pass: true,
+    detail: 'alive → downed (still a body, immune to further damage) → wraith (no collision)',
+  };
+}
+
+export function checkReviveRequiresSustainedChannel(): CheckResult {
+  // The 3s channel is a commitment (§8). If it could be chipped away between
+  // dodges it would not be one.
+  // All slots human: only the rescuer we drive is channelling, so an
+  // interrupt is genuinely an interrupt.
+  const world = new World('revive-seed', PARTY_SIZE);
+  const victim = world.party[0]!.player;
+  const rescuer = world.party[1]!.player;
+
+  victim.takeDamage(PLAYER.MAX_HP);
+  rescuer.x = victim.x + 10;
+  rescuer.y = victim.y;
+
+  const channelTicks = Math.round(DEATH.REVIVE_CHANNEL * SIM.TICK_RATE);
+
+  const channelling = makeInputState();
+  channelling.contextAction.down = true;
+  channelling.contextAction.value = 1;
+
+  // Channel most of the way, then let go for one tick.
+  for (let t = 0; t < channelTicks - 10; t++) {
+    suppressEnemies(world);
+    world.setInput(1, channelling);
+    world.step(SIM.STEP_SECONDS);
+  }
+  const progressBeforeInterrupt = victim.reviveTicks;
+  suppressEnemies(world);
+  world.setInput(1, NEUTRAL);
+  world.step(SIM.STEP_SECONDS);
+
+  if (victim.reviveTicks !== 0) {
+    return {
+      name: 'revive needs an unbroken channel',
+      pass: false,
+      detail: `interrupt left ${victim.reviveTicks} ticks of progress standing`,
+    };
+  }
+  if (victim.life !== LifeState.Downed) {
+    return {
+      name: 'revive needs an unbroken channel',
+      pass: false,
+      detail: 'victim left the downed state without a completed channel',
+    };
+  }
+
+  // Now channel all the way through.
+  for (let t = 0; t < channelTicks + 2 && lifeOf(victim) === LifeState.Downed; t++) {
+    suppressEnemies(world);
+    world.setInput(1, channelling);
+    world.step(SIM.STEP_SECONDS);
+  }
+
+  const revived = lifeOf(victim) === LifeState.Alive && victim.hp === DEATH.REVIVE_HP;
+  return {
+    name: 'revive needs an unbroken channel',
+    pass: revived,
+    detail: revived
+      ? `interrupt reset ${progressBeforeInterrupt} ticks; an unbroken 3s channel revived at ${DEATH.REVIVE_HP}hp`
+      : `after a full channel: ${lifeStateName(lifeOf(victim))} at ${victim.hp}hp`,
+  };
+}
+
+export function checkBotsReviveEachOther(): CheckResult {
+  // The context action (slot 4, §3.3) is the first real consumer of the
+  // four-input budget. A bot pressing it proves the input abstraction carries
+  // a gameplay verb end to end, not just movement.
+  const world = new World('rescue-seed', 0); // all four slots are bots
+  const victim = world.party[2]!.player;
+
+  // Park the party together so a rescuer is plausibly nearby.
+  for (const slot of world.party) {
+    slot.player.x = ROOM.WIDTH / 2;
+    slot.player.y = ROOM.HEIGHT / 2;
+  }
+  victim.takeDamage(PLAYER.MAX_HP);
+
+  let sawChannel = false;
+  const deadline = Math.round(DEATH.BLEED_OUT * SIM.TICK_RATE);
+  for (let t = 0; t < deadline && lifeOf(victim) === LifeState.Downed; t++) {
+    suppressEnemies(world);
+    world.step(SIM.STEP_SECONDS);
+    for (let i = 0; i < world.party.length; i++) {
+      if (i !== 2 && world.party[i]!.input.contextAction.down) sawChannel = true;
+    }
+  }
+
+  const rescued = lifeOf(victim) === LifeState.Alive;
+  return {
+    name: 'bots revive a downed ally',
+    pass: rescued && sawChannel,
+    detail: rescued
+      ? 'a bot pressed the context action and completed the channel'
+      : `victim ended ${lifeStateName(lifeOf(victim))}; any bot channelled: ${sawChannel}`,
+  };
+}
+
+export function checkPartyWipeEndsRun(): CheckResult {
+  // §8 `[LOCKED]`: total party wipe ends the run. No compromise.
+  const world = new World('wipe-seed', 0);
+  if (world.runOver) {
+    return { name: 'party wipe ends the run', pass: false, detail: 'run started already over' };
+  }
+
+  for (const slot of world.party) slot.player.takeDamage(PLAYER.MAX_HP);
+
+  const bleedTicks = Math.round(DEATH.BLEED_OUT * SIM.TICK_RATE);
+  for (let t = 0; t < bleedTicks + 10 && !world.runOver; t++) {
+    world.step(SIM.STEP_SECONDS);
+  }
+
+  return {
+    name: 'party wipe ends the run',
+    pass: world.runOver,
+    detail: world.runOver
+      ? `run ended after all four reached wraith (tick ${world.tick})`
+      : 'four wraiths did not end the run',
   };
 }
 
@@ -430,6 +720,12 @@ export const CHECKS = [
   checkBotDeterminism,
   checkBotsDoNotDesyncOnFramerate,
   checkBotsFightAndSeparate,
+  checkCollisionSeparatesBodies,
+  checkNothingEscapesTheRoom,
+  checkDeathSystem,
+  checkReviveRequiresSustainedChannel,
+  checkBotsReviveEachOther,
+  checkPartyWipeEndsRun,
 ] as const;
 
 export function runAll(): CheckResult[] {

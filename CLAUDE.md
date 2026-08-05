@@ -46,16 +46,13 @@ When a design decision is made in a session, update the manual and add a changel
 
 ## Current phase
 
-**Phase 0 — prototype skeleton.** Goal is the smallest thing that proves the foundation:
+**Phase 0 — prototype skeleton. DONE.** Fixed-timestep loop · input abstraction with M+K and gamepad backends · seeded PRNG · one room with movement and auto-attack. Determinism harness and bot party added on top.
 
-- Fixed-timestep game loop
-- Input abstraction layer with M+K and gamepad backends
-- Seeded PRNG
-- One room, one player, movement, auto-attack against a dummy
+**Phase 1 — combat foundation. In progress.** Collision, an Act I melee enemy with a telegraphed wind-up, waves with §2 party scaling, and the §8 death system (stages 1–2).
 
-Nothing else. No procedural generation, no items, no classes beyond a placeholder.
+Still absent, in rough dependency order: room templates and the layout graph · shared camera and locked doors · classes and the three ability slots · items and upgrade axes · a boss.
 
-Phase 0 exists to answer manual §13's questions. Do not expand scope past the skeleton without asking.
+No procedural generation, no items, no classes yet. **Ask before expanding scope past the current milestone.**
 
 ## Commands
 
@@ -78,7 +75,8 @@ No linter yet — TypeScript is in strict mode with `noUnusedLocals`, `noUncheck
 src/
   core/        constants · rng · fixed-loop · checksum   — engine-agnostic
   input/       input-state · input-manager · backends/{keyboard-mouse,gamepad}
-  game/        world · targeting · controller · bot · entities/{entity,player,dummy}
+  game/        world · targeting · collision · controller · bot · life-state
+               entities/{entity,player,enemy}
   scenes/      game-scene.ts                             — the only Phaser-aware file besides main.ts
 test/
   determinism.ts                                         — run with `npm test`
@@ -98,6 +96,21 @@ Bot decisions are a pure function of world state plus a forked PRNG, so **lockst
 
 Bots hold a standoff band at ~72% of attack range and steer apart from allies. That separation is standing in for collision, which arrives in Phase 1 — without it four bodies occupy one pixel and §13's readability question can't be asked.
 
+## Combat and death (§8)
+
+Players run a three-stage life machine, not an `alive` boolean:
+
+**Alive → Downed → Wraith.** Downed players crawl, can't attack, bleed out over 20s, and are **still a body in the world** — allies reach them. Any Alive ally revives with an unbroken 3s channel on the context action (slot 4). Interrupting resets the channel to zero rather than decaying it, so the 3s is a real commitment. Wraiths can't be hurt, don't collide, and slow nearby enemies — still playing, weakly. Total party wipe ends the run (`[LOCKED]`).
+
+**Stage 3 (resurrection at a boss / shop shrine / revive item) is not built** — it needs bosses and shops.
+
+Two rules the code follows that are easy to break by accident:
+
+- **Enemies ignore Downed players.** §8's design rule is that anything piling on when the party is already losing is a death spiral. It also makes reviving a real option rather than a trap.
+- **Wave size scales with party *size*, never living players** — same reason.
+
+`WAVE.CLEAR_HEAL` is **sandbox scaffolding, not balance.** Nothing heals yet (no pickups, shop, or items), so continuous waves guarantee an attrition wipe. Delete it when §2's room-clear rewards exist.
+
 ## Determinism
 
 `World.checksum()` hashes every field the simulation reads — positions by exact IEEE-754 bits, plus the RNG state. This is not test scaffolding: lockstep peers exchange it periodically to catch desync on the tick it happens (§16.3, §16.7).
@@ -107,6 +120,10 @@ Bots hold a standoff band at ~72% of attack range and steer apart from allies. T
 `npm test` covers: same seed + same inputs → identical 1800-tick trace · framerate independence across 60/144/30/stuttering frame patterns · seeds actually differ · `Math.random` is trapped and never called during a sim run · PRNG reproducibility, state round-trip, fork independence · the checksum notices a one-ULP drift · the bot party replays identically and is framerate-independent · bots actually engage and stay separated.
 
 These have been mutation-tested — injecting `Math.random` into world generation, leaking real frame time into the sim `dt`, and zeroing bot separation each fail the suite. The `dt` mutation notably still *passes* at 60fps and only fails at 144fps.
+
+Combat adds: collision keeps bodies apart (sampled every tick, not just the last one) · nothing escapes the room · the §8 stage transitions · revive needs an unbroken channel · bots revive a downed ally · a party wipe ends the run.
+
+Checks that isolate a mechanic call `suppressEnemies` — otherwise a rescuer standing still for a 3s channel gets beaten down and the check fails for reasons unrelated to what it tests.
 
 Two checks are deliberately non-vacuous: the bot replay check also asserts bots *left the spawn ring* (a party of statues would satisfy every determinism check ever written), and the separation check asserts dummies are taking damage.
 
