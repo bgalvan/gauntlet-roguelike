@@ -1,5 +1,14 @@
 import { Hasher } from '../core/checksum';
-import { COMBAT, DEATH, PARTY_SIZE, PLAYER, ROOM, SIM, WAVE } from '../core/constants';
+import {
+  COMBAT,
+  DEATH,
+  DOOR,
+  LEASH,
+  PARTY_SIZE,
+  ROOM,
+  SIM,
+  WAVE,
+} from '../core/constants';
 import { Rng } from '../core/rng';
 import type { InputState } from '../input/input-state';
 import { clearInputState, makeInputState } from '../input/input-state';
@@ -8,7 +17,7 @@ import { BotController } from './bot';
 import { CLASS_ORDER } from './classes';
 import type { ClassId } from './classes';
 import { resolveCollisions } from './collision';
-import type { PlayerController } from './controller';
+import type { PlayerController, RoomBounds } from './controller';
 import { HumanController } from './controller';
 import { Enemy } from './entities/enemy';
 import type { Entity } from './entities/entity';
@@ -16,9 +25,13 @@ import { Player } from './entities/player';
 import { Projectile } from './entities/projectile';
 import { EventBuffer, EventKind } from './events';
 import { LifeState } from './life-state';
+import { generateFloor, RoomKind } from './rooms/floor';
+import type { Floor, RoomNode } from './rooms/floor';
+import { ALL_DIRECTIONS, Direction, oppositeDirection } from './rooms/templates';
 
-const RESPAWN_DELAY_TICKS = Math.round(WAVE.RESPAWN_DELAY * SIM.TICK_RATE);
 const REVIVE_RANGE_SQ = DEATH.REVIVE_RANGE * DEATH.REVIVE_RANGE;
+const TRANSITION_TICKS = Math.round(DOOR.TRANSITION * SIM.TICK_RATE);
+const LEASH_GRACE_TICKS = Math.round(LEASH.GRACE * SIM.TICK_RATE);
 
 /** One party member: an entity, whatever drives it, and its input buffer. */
 export interface PartySlot {
@@ -26,6 +39,16 @@ export interface PartySlot {
   readonly controller: PlayerController;
   /** This slot's input for the current tick. Reused, never reallocated. */
   readonly input: InputState;
+}
+
+/** A door opening on one wall of the current room. */
+export interface DoorInstance {
+  readonly direction: Direction;
+  readonly targetRoom: number;
+  /** Centre of the opening, in room coordinates. */
+  readonly x: number;
+  readonly y: number;
+  open: boolean;
 }
 
 /**
@@ -42,6 +65,17 @@ export class World {
 
   readonly party: PartySlot[] = [];
   readonly enemies: Enemy[] = [];
+  readonly projectiles: Projectile[] = [];
+  readonly events = new EventBuffer();
+
+  /** The generated floor (§2). Fully reproducible from the seed. */
+  readonly floor: Floor;
+
+  /** Index into `floor.rooms`. */
+  currentRoom: number;
+
+  /** Doors of the current room, rebuilt on entry. */
+  readonly doors: DoorInstance[] = [];
 
   /** Simulation steps run. Authoritative clock — nothing reads wall time. */
   tick = 0;
@@ -49,31 +83,47 @@ export class World {
   /** Total party wipe ends the run (§8, `[LOCKED]`). */
   runOver = false;
 
-  /** Waves cleared this run. Stands in for room progression. */
-  wavesCleared = 0;
+  /** Set once the boss room is cleared. */
+  floorComplete = false;
+
+  roomsCleared = 0;
+
+  /** Ticks left in a door transition; 0 when not transitioning. */
+  transitionTicks = 0;
+  /** Direction the party is travelling during a transition, for the wipe. */
+  transitionDirection: Direction = Direction.North;
+  private pendingRoom = -1;
+
+  /** The door of the current room the party walked in through, or null for
+   *  the entry room. */
+  private arrivedVia: Direction | null = null;
+
+  /**
+   * Which door leads onward. Recomputed on room entry and when doors unlock.
+   *
+   * A local "not the door I came in by" rule is not enough: on a dead-end
+   * branch the only door *is* the arrival door, so the party bounced straight
+   * back out, and the room behind it sent them straight back in. Measured:
+   * 2593 transitions across 7 rooms. This is a graph search instead, so the
+   * chosen door is always a step along a real path to somewhere new.
+   */
+  private preferredExit: Direction | null = null;
 
   private nextEntityId = 0;
-  private respawnTicks = 0;
 
   private readonly playerCache: readonly Player[];
-  /** Reused scratch arrays — `step` runs 60 times a second and must not
-   *  allocate. Contents are rebuilt each tick. */
   private readonly wraiths: Player[] = [];
   private readonly bodies: Entity[] = [];
   private readonly abilityContext: AbilityContext;
 
-  /** Live projectiles, pooled. */
-  readonly projectiles: Projectile[] = [];
+  /** Ticks each slot has spent beyond the leash radius. */
+  private readonly leashTicks: number[] = [];
 
-  /** Cosmetic events for this tick. Cleared every step, never checksummed. */
-  readonly events = new EventBuffer();
+  /** Party centroid, recomputed each tick. The camera follows this, and so
+   *  does the leash — one definition, so they can never disagree. */
+  centroidX = 0;
+  centroidY = 0;
 
-  /**
-   * @param seed       run seed — everything random derives from this
-   * @param humanSlots how many slots are driven from outside; the rest are
-   *                   bots. Solo testing is 1; four humans is 4.
-   * @param classIds   one class per slot; defaults to one of each (§3.1)
-   */
   constructor(
     seed: number | string,
     humanSlots = 1,
@@ -86,35 +136,78 @@ export class World {
       this.projectiles.push(new Projectile(-1000 - i));
     }
 
-    // Spawn in a ring so the party starts spread out rather than stacked.
-    const spawnRadius = PLAYER.RADIUS * 5;
+    // The floor is drawn from the run seed before anything else consumes the
+    // stream, so the same seed always produces the same floor regardless of
+    // party composition.
+    this.floor = generateFloor(this.rng.fork());
+    this.currentRoom = this.floor.entryIndex;
+
+    const entry = this.room;
     for (let slot = 0; slot < PARTY_SIZE; slot++) {
       const angle = (slot / PARTY_SIZE) * Math.PI * 2;
       const isBot = slot >= humanSlots;
       const player = new Player(
         this.nextEntityId++,
         slot,
-        ROOM.WIDTH / 2 + Math.cos(angle) * spawnRadius,
-        ROOM.HEIGHT / 2 + Math.sin(angle) * spawnRadius,
+        entry.template.safePocket.x + Math.cos(angle) * 70,
+        entry.template.safePocket.y + Math.sin(angle) * 70,
         isBot,
         classIds[slot] ?? CLASS_ORDER[slot % CLASS_ORDER.length]!,
       );
 
-      // Each bot gets its own forked stream, so a bot consuming a different
-      // number of rolls can never shift another system's sequence.
       const controller: PlayerController = isBot
         ? new BotController(this.rng.fork())
         : new HumanController(makeInputState());
 
       this.party.push({ player, controller, input: makeInputState() });
+      this.leashTicks.push(0);
     }
 
     this.playerCache = this.party.map((s) => s.player);
     this.abilityContext = this.buildAbilityContext();
-    this.spawnWave();
+    this.enterRoom(this.currentRoom, null);
   }
 
-  /** Slot 0 — the player at this keyboard. Renderer-facing convenience. */
+  // --- accessors -----------------------------------------------------------
+
+  get room(): RoomNode {
+    return this.floor.rooms[this.currentRoom]!;
+  }
+
+  get roomWidth(): number {
+    return this.room.template.width;
+  }
+
+  get roomHeight(): number {
+    return this.room.template.height;
+  }
+
+  get roomBounds(): RoomBounds {
+    let exit: { x: number; y: number } | null = null;
+    for (let i = 0; i < this.doors.length; i++) {
+      const door = this.doors[i]!;
+      if (!door.open) continue;
+      if (door.direction !== this.preferredExit) continue;
+      exit = { x: door.x, y: door.y };
+      break;
+    }
+
+    return {
+      width: this.roomWidth,
+      height: this.roomHeight,
+      exit,
+      botsLead: this.botsLead,
+    };
+  }
+
+  /** True when nobody in the party is externally driven. */
+  get botsLead(): boolean {
+    for (let i = 0; i < this.playerCache.length; i++) {
+      if (!this.playerCache[i]!.botControlled) return false;
+    }
+    return true;
+  }
+
   get localPlayer(): Player {
     return this.party[0]!.player;
   }
@@ -129,11 +222,20 @@ export class World {
     return n;
   }
 
-  /**
-   * Hand a human-driven slot its input for the coming tick. Called before
-   * `step`. Later this is also where a remote peer's input frame or a replay
-   * log enters the simulation — from the sim's side they are the same thing.
-   */
+  /** True while the room still has to be fought. Doors stay shut (§2). */
+  get inCombat(): boolean {
+    return this.enemiesRemaining > 0;
+  }
+
+  /** How far a slot is outside the leash, 0 when inside. Render uses it for
+   *  the directional arrow (§2). */
+  leashOvershoot(slot: number): number {
+    const p = this.party[slot]?.player;
+    if (!p) return 0;
+    const d = Math.hypot(p.x - this.centroidX, p.y - this.centroidY);
+    return Math.max(0, d - LEASH.RADIUS);
+  }
+
   setInput(slot: number, state: InputState): void {
     const entry = this.party[slot];
     if (!entry) return;
@@ -141,7 +243,8 @@ export class World {
     (entry.controller as HumanController).set(state);
   }
 
-  /** One fixed simulation step. `dt` is always SIM.STEP_SECONDS. */
+  // --- step ----------------------------------------------------------------
+
   step(dt: number): void {
     this.events.clear();
 
@@ -151,17 +254,31 @@ export class World {
       if (this.projectiles[i]!.active) this.projectiles[i]!.snapshot();
     }
 
-    // Two passes, deliberately. Every controller decides against the same
-    // start-of-tick state, so a bot's choice cannot depend on whether it
-    // happens to sit before or after another player in the array.
+    // A transition freezes the room: no input, no fighting, just the wipe.
+    if (this.transitionTicks > 0) {
+      this.transitionTicks--;
+      if (this.transitionTicks === 0 && this.pendingRoom !== -1) {
+        const from = this.transitionDirection;
+        this.currentRoom = this.pendingRoom;
+        this.pendingRoom = -1;
+        this.enterRoom(this.currentRoom, from);
+      }
+      this.tick++;
+      return;
+    }
+
+    const bounds = this.roomBounds;
+
     for (let i = 0; i < this.party.length; i++) {
       const slot = this.party[i]!;
-      // Clear first. Controllers write only the fields they care about, so
-      // without this a button stays held forever after one press — a bot that
-      // pressed the context action once kept "holding" it for the rest of the
-      // run. Harmless for movement, silently wrong for every button.
       clearInputState(slot.input);
-      slot.controller.produceInput(slot.player, this.playerCache, this.enemies, slot.input);
+      slot.controller.produceInput(
+        slot.player,
+        this.playerCache,
+        this.enemies,
+        bounds,
+        slot.input,
+      );
     }
 
     for (let i = 0; i < this.party.length; i++) {
@@ -177,29 +294,316 @@ export class World {
     this.stepProjectiles(dt);
     this.resolveRevives();
 
-    // Knockback and stagger, for every body. After the actors have moved, so
-    // an impulse lands on this tick's position rather than last tick's.
     for (let i = 0; i < this.playerCache.length; i++) this.playerCache[i]!.stepPhysics(dt);
     for (let i = 0; i < this.enemies.length; i++) this.enemies[i]!.stepPhysics(dt);
 
     this.bodies.length = 0;
     for (let i = 0; i < this.playerCache.length; i++) this.bodies.push(this.playerCache[i]!);
     for (let i = 0; i < this.enemies.length; i++) this.bodies.push(this.enemies[i]!);
-    resolveCollisions(this.bodies);
+    resolveCollisions(this.bodies, bounds.width, bounds.height);
 
-    this.updateWaves();
+    this.updateCentroid();
+    this.updateLeash(dt);
+    this.updateRoomState();
+    this.updateDoors();
     this.updateRunState();
 
     this.tick++;
   }
 
-  /** Move shots, resolve impacts. Indexed iteration keeps peers in lockstep. */
+  // --- rooms ---------------------------------------------------------------
+
+  /**
+   * Enter a room: rebuild its doors, spawn its wave if it has never been
+   * cleared, and place the party just inside the door they came through.
+   */
+  private enterRoom(index: number, cameFrom: Direction | null): void {
+    const node = this.floor.rooms[index]!;
+    // Record arrival *before* marking visited, so "somewhere never visited"
+    // still means somewhere new.
+    this.arrivedVia = cameFrom === null ? null : oppositeDirection(cameFrom);
+    this.preferredExit = null;
+    node.visited = true;
+
+    this.doors.length = 0;
+    for (const dir of ALL_DIRECTIONS) {
+      const target = node.exits[dir];
+      if (target === undefined || target === -1) continue;
+      const [dx, dy] = doorCentre(dir, node.template.width, node.template.height);
+      this.doors.push({ direction: dir, targetRoom: target, x: dx, y: dy, open: true });
+    }
+
+    this.enemies.length = 0;
+    for (let i = 0; i < this.projectiles.length; i++) this.projectiles[i]!.retire();
+
+    if (!node.cleared && node.template.spawnAnchors.length > 0) {
+      this.spawnFromAnchors(node);
+    }
+
+    this.placeParty(node, cameFrom);
+    this.updateCentroid();
+    this.updateDoors();
+  }
+
+  /**
+   * Populate from the template's hand-authored anchors, spending the room's
+   * budget. §2 party scaling applies — by party *size*, never living players,
+   * per §8's anti-death-spiral rule.
+   */
+  private spawnFromAnchors(node: RoomNode): void {
+    const scale = WAVE.PARTY_SCALING[this.party.length - 1] ?? 1;
+    // Mild ramp with depth so the far end of a floor is harder than the door.
+    const depthRamp = 1 + node.depth * 0.05;
+    let budget = node.template.budget * scale * depthRamp;
+
+    // Shuffle a copy so which anchors are used varies per seed while the
+    // anchors themselves stay authored.
+    const anchors = this.rng.shuffle(node.template.spawnAnchors.slice());
+    const pocket = node.template.safePocket;
+
+    for (let i = 0; i < anchors.length && budget > 0; i++) {
+      const anchor = anchors[i]!;
+      if (anchor.cost > budget) continue;
+
+      // Belt and braces: authoring should never put an anchor in the pocket,
+      // but a template edit that does would make a room unenterable.
+      const dx = anchor.x - pocket.x;
+      const dy = anchor.y - pocket.y;
+      if (dx * dx + dy * dy < pocket.radius * pocket.radius) continue;
+
+      this.enemies.push(new Enemy(this.nextEntityId++, anchor.x, anchor.y));
+      budget -= anchor.cost;
+    }
+
+    // Anchors are finite; a high-budget room reuses them with a small offset
+    // rather than inventing positions the designer never approved.
+    let ring = 1;
+    while (budget > 0 && anchors.length > 0 && ring < 4) {
+      for (let i = 0; i < anchors.length && budget > 0; i++) {
+        const anchor = anchors[i]!;
+        if (anchor.cost > budget) continue;
+        const angle = (i / anchors.length) * Math.PI * 2;
+        const x = clamp(anchor.x + Math.cos(angle) * 46 * ring, 60, node.template.width - 60);
+        const y = clamp(anchor.y + Math.sin(angle) * 46 * ring, 60, node.template.height - 60);
+        const px = x - pocket.x;
+        const py = y - pocket.y;
+        if (px * px + py * py < pocket.radius * pocket.radius) continue;
+        this.enemies.push(new Enemy(this.nextEntityId++, x, y));
+        budget -= anchor.cost;
+      }
+      ring++;
+    }
+  }
+
+  /** Put the party in the safe pocket, or just inside the door they used. */
+  private placeParty(node: RoomNode, cameFrom: Direction | null): void {
+    let baseX = node.template.safePocket.x;
+    let baseY = node.template.safePocket.y;
+
+    const spread = 58;
+
+    if (cameFrom !== null) {
+      // They arrive at the door opposite the one they left through.
+      //
+      // The offset has to clear the doorway trigger by more than the spread
+      // radius, or a party member on the ring lands *inside* the door they
+      // just came out of and instantly transitions back. Measured: a dead-end
+      // room traded the party back and forth every 22 ticks, forever.
+      const entryDir = oppositeDirection(cameFrom);
+      const [dx, dy] = doorCentre(entryDir, node.template.width, node.template.height);
+      const inward = inwardVector(entryDir);
+      const clearance = DOOR.DEPTH + spread + 40;
+      baseX = dx + inward[0] * clearance;
+      baseY = dy + inward[1] * clearance;
+    }
+
+    for (let i = 0; i < this.party.length; i++) {
+      const p = this.party[i]!.player;
+      const angle = (i / this.party.length) * Math.PI * 2;
+      p.x = clamp(baseX + Math.cos(angle) * spread, ROOM.WALL + p.radius, node.template.width - ROOM.WALL - p.radius);
+      p.y = clamp(baseY + Math.sin(angle) * spread, ROOM.WALL + p.radius, node.template.height - ROOM.WALL - p.radius);
+      p.prevX = p.x;
+      p.prevY = p.y;
+      p.knockX = 0;
+      p.knockY = 0;
+      p.target = null;
+      this.leashTicks[i] = 0;
+    }
+  }
+
+  /** §2: doors lock during combat. */
+  private updateDoors(): void {
+    const open = !this.inCombat;
+    let changed = false;
+    for (let i = 0; i < this.doors.length; i++) {
+      if (this.doors[i]!.open !== open) changed = true;
+      this.doors[i]!.open = open;
+    }
+    if (changed || this.preferredExit === null) this.computePreferredExit();
+  }
+
+  /**
+   * Breadth-first search for the first step toward somewhere worth going:
+   * the nearest unvisited room, or the boss once everything is explored.
+   *
+   * Deterministic — the frontier is a plain array walked in insertion order
+   * and neighbours are visited in fixed direction order, so every peer picks
+   * the same door without exchanging anything.
+   */
+  private computePreferredExit(): void {
+    const rooms = this.floor.rooms;
+    const cameFrom = new Map<number, { from: number; dir: Direction }>();
+    const seen = new Set<number>([this.currentRoom]);
+    const frontier: number[] = [this.currentRoom];
+    let goal = -1;
+
+    for (let head = 0; head < frontier.length; head++) {
+      const at = frontier[head]!;
+      if (at !== this.currentRoom && !rooms[at]!.visited) {
+        goal = at;
+        break;
+      }
+      for (const dir of ALL_DIRECTIONS) {
+        const next = rooms[at]!.exits[dir];
+        if (next === undefined || next === -1 || seen.has(next)) continue;
+        seen.add(next);
+        cameFrom.set(next, { from: at, dir });
+        frontier.push(next);
+      }
+    }
+
+    // Everything explored: head for the boss, unless we are standing in it.
+    if (goal === -1 && this.floor.bossIndex !== this.currentRoom) {
+      goal = seen.has(this.floor.bossIndex) ? this.floor.bossIndex : -1;
+    }
+
+    if (goal === -1) {
+      this.preferredExit = null;
+      return;
+    }
+
+    // Walk the parent chain back to the current room; the last hop is ours.
+    let cursor = goal;
+    let step = cameFrom.get(cursor);
+    while (step && step.from !== this.currentRoom) {
+      cursor = step.from;
+      step = cameFrom.get(cursor);
+    }
+    this.preferredExit = step ? step.dir : null;
+  }
+
+  private updateRoomState(): void {
+    const node = this.room;
+    if (node.cleared || this.inCombat) {
+      this.checkDoorEntry();
+      return;
+    }
+
+    // Room cleared this tick.
+    node.cleared = true;
+    this.roomsCleared++;
+    this.healOnClear();
+    if (node.kind === RoomKind.Boss) this.floorComplete = true;
+  }
+
+  /**
+   * Any living player standing in an open doorway moves the whole party.
+   *
+   * Moving everyone rather than just the one who touched it is deliberate:
+   * the leash already keeps the party together, and splitting them across
+   * rooms would need the split-screen that §2 explicitly `[CUT]`.
+   */
+  private checkDoorEntry(): void {
+    if (this.transitionTicks > 0) return;
+    const botsLead = this.botsLead;
+
+    for (let d = 0; d < this.doors.length; d++) {
+      const door = this.doors[d]!;
+      if (!door.open) continue;
+
+      for (let i = 0; i < this.party.length; i++) {
+        const p = this.party[i]!.player;
+        if (p.life === LifeState.Wraith) continue;
+        // A bot never leads the party through a door while a human is in it.
+        // §2 locks doors so nobody gets dragged ahead; a bot triggering the
+        // transition would do exactly that from the other direction.
+        if (p.botControlled && !botsLead) continue;
+        if (!inDoorway(p.x, p.y, door, this.roomWidth, this.roomHeight)) continue;
+
+        this.transitionTicks = TRANSITION_TICKS;
+        this.transitionDirection = door.direction;
+        this.pendingRoom = door.targetRoom;
+        return;
+      }
+    }
+  }
+
+  // --- leash ---------------------------------------------------------------
+
+  private updateCentroid(): void {
+    let sx = 0;
+    let sy = 0;
+    let n = 0;
+    for (let i = 0; i < this.playerCache.length; i++) {
+      const p = this.playerCache[i]!;
+      // Wraiths do not anchor the camera — a dead player drifting the room
+      // would drag the frame away from the fight.
+      if (p.life === LifeState.Wraith) continue;
+      sx += p.x;
+      sy += p.y;
+      n++;
+    }
+    if (n === 0) {
+      this.centroidX = this.roomWidth / 2;
+      this.centroidY = this.roomHeight / 2;
+      return;
+    }
+    this.centroidX = sx / n;
+    this.centroidY = sy / n;
+  }
+
+  /**
+   * Soft leash (§2): light damage-over-time while outside the radius.
+   *
+   * Damage is applied in whole points on an interval rather than as a
+   * fractional amount every tick, because accumulating `rate * dt` into HP
+   * sixty times a second is exactly the float drift constraint #3 warns about.
+   */
+  private updateLeash(_dt: number): void {
+    const tickInterval = Math.round(SIM.TICK_RATE / LEASH.DAMAGE_PER_SECOND);
+
+    for (let i = 0; i < this.party.length; i++) {
+      const p = this.party[i]!.player;
+      if (p.life !== LifeState.Alive) {
+        this.leashTicks[i] = 0;
+        continue;
+      }
+
+      const dx = p.x - this.centroidX;
+      const dy = p.y - this.centroidY;
+      if (dx * dx + dy * dy <= LEASH.RADIUS * LEASH.RADIUS) {
+        this.leashTicks[i] = 0;
+        continue;
+      }
+
+      const ticks = (this.leashTicks[i] ?? 0) + 1;
+      this.leashTicks[i] = ticks;
+      if (ticks <= LEASH_GRACE_TICKS) continue;
+      if ((ticks - LEASH_GRACE_TICKS) % tickInterval !== 0) continue;
+
+      p.takeDamage(1, this.centroidX, this.centroidY);
+      this.events.emit(EventKind.Hit, p.x, p.y, { amount: 0, slot: p.slot });
+    }
+  }
+
+  // --- projectiles / revives / run state ------------------------------------
+
   private stepProjectiles(dt: number): void {
     for (let i = 0; i < this.projectiles.length; i++) {
       const shot = this.projectiles[i]!;
       if (!shot.active) continue;
 
-      if (!shot.advance(dt)) {
+      if (!shot.advance(dt, this.room.template.width, this.room.template.height)) {
         shot.retire();
         continue;
       }
@@ -229,7 +633,6 @@ export class World {
           { amount: shot.damage_, dirX: nx, dirY: ny, slot: shot.ownerSlot },
         );
 
-        // Rage is built by landing hits, including at range.
         const owner = this.party[shot.ownerSlot];
         if (owner) owner.player.gainOnHit();
 
@@ -242,11 +645,6 @@ export class World {
     }
   }
 
-  /**
-   * Handed to players so abilities can act on the room without importing the
-   * world. Built in the constructor, because a field initializer would run
-   * before the party exists.
-   */
   private buildAbilityContext(): AbilityContext {
     return {
       enemies: this.enemies,
@@ -259,8 +657,6 @@ export class World {
           shot.launch(x, y, dirX, dirY, speed, damage, ownerSlot, opts ?? {});
           return true;
         }
-        // Pool exhausted. Dropping the shot is the right failure — growing the
-        // pool without bound is how a frame budget dies (constraint #4).
         return false;
       },
     };
@@ -274,14 +670,6 @@ export class World {
     }
   }
 
-  /**
-   * Stage 1 revives (§8): any ally in range holding the context action.
-   *
-   * Slot 4 — context — is the same input used for pickup, transfer and
-   * interact (§3.3). They never conflict because you are either standing on
-   * something or you aren't, so one binding covers all of them. This is the
-   * first real consumer of the four-input budget.
-   */
   private resolveRevives(): void {
     for (let i = 0; i < this.party.length; i++) {
       const downed = this.party[i]!.player;
@@ -291,7 +679,6 @@ export class World {
       for (let j = 0; j < this.party.length; j++) {
         if (i === j) continue;
         const ally = this.party[j]!;
-        // Only an Alive ally can revive — a Downed or Wraith player cannot.
         if (ally.player.life !== LifeState.Alive) continue;
         if (!ally.input.contextAction.down) continue;
 
@@ -307,33 +694,14 @@ export class World {
     }
   }
 
-  private updateWaves(): void {
-    if (this.enemiesRemaining > 0) {
-      this.respawnTicks = 0;
-      return;
-    }
-    // Wave cleared. Stands in for "room cleared, doors unlock" (§2) until the
-    // room system exists.
-    if (this.respawnTicks === 0) {
-      this.wavesCleared++;
-      this.respawnTicks = RESPAWN_DELAY_TICKS;
-      this.healOnClear();
-      return;
-    }
-    this.respawnTicks--;
-    if (this.respawnTicks === 0) this.spawnWave();
-  }
-
   /**
-   * Sandbox scaffolding — see WAVE.CLEAR_HEAL. Deliberately heals only living
-   * players: healing a Downed player would quietly undo §8's stage 1 and turn
-   * every wave clear into a free party revive.
+   * Sandbox scaffolding — see WAVE.CLEAR_HEAL. Heals only living players:
+   * healing a Downed player would quietly undo §8's stage 1.
    */
   private healOnClear(): void {
     for (let i = 0; i < this.playerCache.length; i++) {
       const p = this.playerCache[i]!;
       if (p.life !== LifeState.Alive) continue;
-      // Fraction of each player's own pool — class HP ranges 82–150.
       p.hp = Math.min(p.maxHp, p.hp + p.maxHp * WAVE.CLEAR_HEAL);
     }
   }
@@ -346,65 +714,92 @@ export class World {
     this.runOver = true;
   }
 
-  /**
-   * §2 party scaling: 100 / 165 / 220 / 270% of the base budget for 1–4
-   * players. Scaled by party *size*, never by living players — see the note
-   * on death spirals in constants.ts.
-   */
-  private spawnWave(): void {
-    this.enemies.length = 0;
+  // --- checksum ------------------------------------------------------------
 
-    const scale = WAVE.PARTY_SCALING[this.party.length - 1] ?? 1;
-    const count = Math.round(WAVE.BASE_COUNT * scale);
-
-    const margin = ROOM.WALL + 60;
-    for (let i = 0; i < count; i++) {
-      let x = 0;
-      let y = 0;
-      // Templates will declare spawn anchors and a safe pocket (§2). Until
-      // then: reject positions too close to a player, with a bounded number
-      // of attempts so the RNG draw count stays deterministic and finite.
-      for (let attempt = 0; attempt < 12; attempt++) {
-        x = this.rng.range(margin, ROOM.WIDTH - margin);
-        y = this.rng.range(margin, ROOM.HEIGHT - margin);
-        if (this.farFromPlayers(x, y)) break;
-      }
-      this.enemies.push(new Enemy(this.nextEntityId++, x, y));
-    }
-  }
-
-  private farFromPlayers(x: number, y: number): boolean {
-    for (let i = 0; i < this.playerCache.length; i++) {
-      const p = this.playerCache[i]!;
-      const dx = p.x - x;
-      const dy = p.y - y;
-      if (dx * dx + dy * dy < WAVE.SAFE_SPAWN_DISTANCE * WAVE.SAFE_SPAWN_DISTANCE) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Hash of everything the simulation depends on. Two peers running the same
-   * tick with the same inputs must produce the same string; the first tick
-   * where they differ is the desync.
-   *
-   * Includes the RNG state — a peer that has consumed a different number of
-   * rolls is already diverging, even if no entity has visibly moved yet.
-   */
   checksum(): string {
     const h = new Hasher();
-    h.int(this.tick).int(this.rng.getState()).int(this.respawnTicks).bool(this.runOver);
+    h.int(this.tick)
+      .int(this.rng.getState())
+      .int(this.currentRoom)
+      .int(this.transitionTicks)
+      .int(this.pendingRoom)
+      .int(this.roomsCleared)
+      .int(this.arrivedVia ?? -1)
+      .bool(this.runOver)
+      .bool(this.floorComplete);
+
+    // Visited flags steer bot navigation, so they decide future inputs.
+    for (let i = 0; i < this.floor.rooms.length; i++) {
+      h.bool(this.floor.rooms[i]!.visited);
+    }
+
+    // Room clear flags decide whether re-entering spawns a wave.
+    for (let i = 0; i < this.floor.rooms.length; i++) {
+      h.bool(this.floor.rooms[i]!.cleared);
+    }
+
     for (let i = 0; i < this.party.length; i++) {
       const slot = this.party[i]!;
       slot.player.writeChecksum(h);
-      // A bot's internal RNG and phase decide its future inputs, so they are
-      // simulation state as much as any position is.
       slot.controller.writeChecksum?.(h);
+      h.int(this.leashTicks[i] ?? 0);
     }
     for (let i = 0; i < this.enemies.length; i++) this.enemies[i]!.writeChecksum(h);
-    // Projectiles are simulation state — a peer whose shot is one tick behind
-    // has already diverged. Inactive pool slots hash to a constant.
     for (let i = 0; i < this.projectiles.length; i++) this.projectiles[i]!.writeChecksum(h);
     return h.value;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Centre of the opening on a given wall. */
+function doorCentre(dir: Direction, width: number, height: number): [number, number] {
+  switch (dir) {
+    case Direction.North:
+      return [width / 2, 0];
+    case Direction.East:
+      return [width, height / 2];
+    case Direction.South:
+      return [width / 2, height];
+    default:
+      return [0, height / 2];
+  }
+}
+
+/** Unit vector pointing into the room from a wall. */
+function inwardVector(dir: Direction): [number, number] {
+  switch (dir) {
+    case Direction.North:
+      return [0, 1];
+    case Direction.East:
+      return [-1, 0];
+    case Direction.South:
+      return [0, -1];
+    default:
+      return [1, 0];
+  }
+}
+
+function inDoorway(
+  x: number,
+  y: number,
+  door: DoorInstance,
+  width: number,
+  height: number,
+): boolean {
+  const half = DOOR.WIDTH / 2;
+  switch (door.direction) {
+    case Direction.North:
+      return Math.abs(x - door.x) <= half && y <= DOOR.DEPTH;
+    case Direction.South:
+      return Math.abs(x - door.x) <= half && y >= height - DOOR.DEPTH;
+    case Direction.East:
+      return Math.abs(y - door.y) <= half && x >= width - DOOR.DEPTH;
+    default:
+      return Math.abs(y - door.y) <= half && x <= DOOR.DEPTH;
   }
 }

@@ -1,14 +1,14 @@
 import Phaser from 'phaser';
 
-import { ROOM } from './core/constants';
+import { VIEW } from './core/constants';
 import { GameScene } from './scenes/game-scene';
 import { SelectScene } from './scenes/select-scene';
 
 const game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
-  width: ROOM.WIDTH,
-  height: ROOM.HEIGHT,
+  width: VIEW.WIDTH,
+  height: VIEW.HEIGHT,
   backgroundColor: '#0d0d12',
   scale: {
     // Constraint #5: the canvas scales to the window, nothing is positioned

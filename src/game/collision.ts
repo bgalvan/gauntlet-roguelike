@@ -14,7 +14,11 @@ import type { Entity } from './entities/entity';
  * around 150 bodies — constraint #4 caps entity counts well below that, but
  * a uniform grid is the fix when it bites.
  */
-export function resolveCollisions(bodies: readonly Entity[]): void {
+export function resolveCollisions(
+  bodies: readonly Entity[],
+  roomWidth: number,
+  roomHeight: number,
+): void {
   // Walls are clamped *inside* the loop, not just at the end.
   //
   // Clamping only once at the end reintroduces overlap: a body shoved into a
@@ -23,7 +27,7 @@ export function resolveCollisions(bodies: readonly Entity[]): void {
   // enemies against a wall ended 13u deep, nearly half a body.
   for (let pass = 0; pass < COLLISION.ITERATIONS; pass++) {
     separate(bodies);
-    for (let i = 0; i < bodies.length; i++) clampToRoom(bodies[i]!);
+    for (let i = 0; i < bodies.length; i++) clampToRoom(bodies[i]!, roomWidth, roomHeight);
   }
 }
 
@@ -72,11 +76,11 @@ function separate(bodies: readonly Entity[]): void {
   }
 }
 
-function clampToRoom(body: Entity): void {
+function clampToRoom(body: Entity, roomWidth: number, roomHeight: number): void {
   const minX = ROOM.WALL + body.radius;
-  const maxX = ROOM.WIDTH - ROOM.WALL - body.radius;
+  const maxX = roomWidth - ROOM.WALL - body.radius;
   const minY = ROOM.WALL + body.radius;
-  const maxY = ROOM.HEIGHT - ROOM.WALL - body.radius;
+  const maxY = roomHeight - ROOM.WALL - body.radius;
   if (body.x < minX) body.x = minX;
   if (body.x > maxX) body.x = maxX;
   if (body.y < minY) body.y = minY;

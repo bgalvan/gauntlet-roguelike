@@ -74,15 +74,15 @@ export class Projectile extends Entity {
   }
 
   /** Advance. Returns false when it should be retired. */
-  advance(dt: number): boolean {
+  advance(dt: number, roomWidth: number, roomHeight: number): boolean {
     this.x += this.vx * dt;
     this.y += this.vy * dt;
     this.lifeTicks--;
 
     if (this.lifeTicks <= 0) return false;
     // Walls stop shots. Doors and destructibles are a later concern.
-    if (this.x < ROOM.WALL || this.x > ROOM.WIDTH - ROOM.WALL) return false;
-    if (this.y < ROOM.WALL || this.y > ROOM.HEIGHT - ROOM.WALL) return false;
+    if (this.x < ROOM.WALL || this.x > roomWidth - ROOM.WALL) return false;
+    if (this.y < ROOM.WALL || this.y > roomHeight - ROOM.WALL) return false;
     return true;
   }
 

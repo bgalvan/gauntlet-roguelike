@@ -5,7 +5,7 @@ import type { InputState } from '../input/input-state';
 import { clampToUnit } from '../input/input-state';
 import { AbilityId } from './classes';
 import type { AbilityDef } from './classes';
-import type { PlayerController } from './controller';
+import type { PlayerController, RoomBounds } from './controller';
 import { distanceSq } from './entities/entity';
 import type { Entity } from './entities/entity';
 import type { Player } from './entities/player';
@@ -57,6 +57,7 @@ export class BotController implements PlayerController {
     self: Player,
     allies: readonly Player[],
     enemies: readonly Entity[],
+    room: RoomBounds,
     out: InputState,
   ): void {
     this.age++;
@@ -77,7 +78,7 @@ export class BotController implements PlayerController {
         this.haunt(self, enemies, out);
         return;
       default:
-        this.fight(self, allies, enemies, out);
+        this.fight(self, allies, enemies, room, out);
     }
   }
 
@@ -87,6 +88,7 @@ export class BotController implements PlayerController {
     self: Player,
     allies: readonly Player[],
     enemies: readonly Entity[],
+    room: RoomBounds,
     out: InputState,
   ): void {
     let steerX = 0;
@@ -126,7 +128,7 @@ export class BotController implements PlayerController {
         steerX = dx / dist;
         steerY = dy / dist;
       }
-      this.applySteering(self, steerX, steerY, allies, out);
+      this.applySteering(self, steerX, steerY, allies, room, out);
       return;
     }
 
@@ -164,10 +166,29 @@ export class BotController implements PlayerController {
           steerY += towardX * this.strafeSign * BOT.STRAFE_WEIGHT;
         }
       }
+    } else if (room.exit && !anyDowned(self, allies)) {
+      // Room is clear and a door is open — head for it. A party that stands
+      // around after winning reads as broken, and with no human in the party
+      // there would be nobody to advance the floor at all.
+      //
+      // Never while an ally is down, though. Non-elected bots were walking to
+      // the exit and triggering a transition mid-revive, which reset the 3s
+      // channel and left the victim to bleed out. Leaving someone bleeding to
+      // take a door is also just wrong.
+      const dx = room.exit.x - self.x;
+      const dy = room.exit.y - self.y;
+      const dist = Math.hypot(dx, dy);
+      // Stop short unless bots are leading: stepping into the doorway moves
+      // the *whole* party, and that decision belongs to the human.
+      const stopAt = room.botsLead ? 0 : BOT.DOOR_STANDOFF;
+      if (dist > stopAt) {
+        steerX += dx / dist;
+        steerY += dy / dist;
+      }
     } else {
-      // Nothing to fight — regroup toward the middle of the room.
-      const dx = ROOM.WIDTH / 2 - self.x;
-      const dy = ROOM.HEIGHT / 2 - self.y;
+      // Nothing to fight and nowhere to go — regroup in the middle.
+      const dx = room.width / 2 - self.x;
+      const dy = room.height / 2 - self.y;
       const dist = Math.hypot(dx, dy);
       if (dist > PLAYER.RADIUS * 4) {
         steerX += dx / dist;
@@ -175,7 +196,7 @@ export class BotController implements PlayerController {
       }
     }
 
-    this.applySteering(self, steerX, steerY, allies, out);
+    this.applySteering(self, steerX, steerY, allies, room, out);
   }
 
   // --- abilities -----------------------------------------------------------
@@ -371,6 +392,7 @@ export class BotController implements PlayerController {
     steerX: number,
     steerY: number,
     allies: readonly Player[],
+    room: RoomBounds,
     out: InputState,
   ): void {
     // Separation. Collision pushes overlapping bodies apart, but steering
@@ -398,9 +420,9 @@ export class BotController implements PlayerController {
     // grind along the edges.
     const margin = ROOM.WALL + PLAYER.RADIUS * 3;
     if (self.x < margin) steerX += 1;
-    if (self.x > ROOM.WIDTH - margin) steerX -= 1;
+    if (self.x > room.width - margin) steerX -= 1;
     if (self.y < margin) steerY += 1;
-    if (self.y > ROOM.HEIGHT - margin) steerY -= 1;
+    if (self.y > room.height - margin) steerY -= 1;
 
     out.moveVector.x = steerX;
     out.moveVector.y = steerY;
@@ -525,6 +547,15 @@ function findById(players: readonly Player[], id: number): Player | null {
     if (players[i]!.id === id) return players[i]!;
   }
   return null;
+}
+
+/** True if any ally other than `self` is downed and still savable. */
+function anyDowned(self: Player, allies: readonly Player[]): boolean {
+  for (let i = 0; i < allies.length; i++) {
+    const ally = allies[i]!;
+    if (ally.id !== self.id && ally.life === LifeState.Downed) return true;
+  }
+  return false;
 }
 
 /** Living enemies inside a circle. Indexed loop — deterministic on all peers. */

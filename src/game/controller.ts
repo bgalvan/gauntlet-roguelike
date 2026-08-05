@@ -16,6 +16,27 @@ import type { Player } from './entities/player';
  * real game. It also means a bot can be swapped for a human, a replay, or a
  * remote peer's input stream without the simulation noticing.
  */
+/**
+ * What a controller needs to know about the room it is standing in. Rooms
+ * vary in size now (§2 templates), so a controller cannot assume one fixed
+ * arena.
+ */
+export interface RoomBounds {
+  readonly width: number;
+  readonly height: number;
+  /** Nearest open exit, or null while the doors are barred by combat (§2). */
+  readonly exit: { readonly x: number; readonly y: number } | null;
+  /**
+   * True when the party contains no externally-driven player.
+   *
+   * Bots gather at the exit but do not step through it while a human is
+   * present — §2 locks doors specifically so nobody gets dragged ahead, and a
+   * bot walking into a doorway would drag the whole party through. With no
+   * human in the party there is nobody to wait for, so bots lead.
+   */
+  readonly botsLead: boolean;
+}
+
 export interface PlayerController {
   readonly kind: 'human' | 'bot';
 
@@ -24,6 +45,7 @@ export interface PlayerController {
     self: Player,
     allies: readonly Player[],
     enemies: readonly Entity[],
+    room: RoomBounds,
     out: InputState,
   ): void;
 
@@ -51,6 +73,7 @@ export class HumanController implements PlayerController {
     _self: Player,
     _allies: readonly Player[],
     _enemies: readonly Entity[],
+    _room: RoomBounds,
     out: InputState,
   ): void {
     copyInputState(this.pending, out);

@@ -52,7 +52,9 @@ When a design decision is made in a session, update the manual and add a changel
 
 **Phase 2 — classes, abilities and feel. DONE.** Four launch classes as data (§3.1), all twelve abilities, per-class resources, projectiles, knockback and stagger, a class-select screen, and the presentation layer — silhouettes, particles, screen shake, damage numbers, synthesized audio.
 
-Still absent, in rough dependency order: room templates and the layout graph · shared camera and locked doors · items and the upgrade axes (§4) · weapon sidegrades (§5) · a boss · the Necromancer (post-launch unlock per §3.1).
+**Phase 3 — floors, doors and the shared camera. DONE.** Hand-authored room templates, a seeded layout graph with a critical path plus branches, doors that lock during combat, room transitions, the §2 shared camera, and the soft leash.
+
+Still absent, in rough dependency order: items and the upgrade axes (§4) · weapon sidegrades (§5) · an actual boss entity (§11 — the arena exists, it currently holds an oversized wave) · the shop and score economy (§10) · treasure and secret rooms · act 2+ templates and hazards · the Necromancer (post-launch unlock per §3.1).
 
 **Ask before expanding scope past the current milestone.**
 
@@ -80,8 +82,9 @@ src/
   input/       input-state · input-manager · backends/{keyboard-mouse,gamepad}
   game/        world · classes · abilities · targeting · collision
                controller · bot · life-state · events
+               rooms/{templates,floor}                     — §2 generation
                entities/{entity,player,enemy,projectile}   — no Phaser, no DOM
-  render/      silhouette · particles · audio              — render-only helpers
+  render/      silhouette · particles · audio · camera     — render-only helpers
   scenes/      select-scene · game-scene                   — Phaser-aware
 test/
   determinism.ts                                           — run with `npm test`
@@ -105,6 +108,30 @@ Ability *behaviour* is keyed by id in `src/game/abilities.ts`. A new class reusi
 **Known contradiction, flagged not resolved:** §3.2 gives the Archer no resource ("pure skill"), but §3.3 says slot 3 is resource-gated. The Archer's payoff runs on a long cooldown instead. Bobby's call.
 
 Bots use all twelve. `checkAllAbilitiesFire` asserts it — three of four classes would otherwise be untested, and untested is where every bug so far has lived. Bots also **hold their resource when the room already warrants the payoff**; without that rule the signature drained the pool on cooldown and Deep Freeze and Shield Slam literally never fired.
+
+## Floors, rooms and doors (§2)
+
+`generateFloor` builds a node graph on a grid: a critical path of 8–12 rooms plus 2–3 branches, then a boss arena at the end. Each node draws a **hand-authored template** from `rooms/templates.ts` — the layout is random, the rooms are designed. Templates declare door positions, spawn anchors with a budget cost, a safe pocket, and hazard slots (declared but unimplemented; the schema is the point).
+
+**Doors lock during combat** and open on clear. Rooms remember `cleared`, so backtracking through a finished room doesn't respawn it.
+
+Three rules the generator has to keep, each of which broke once:
+
+1. **The entry's first step must go east.** The entry template has a single east door; letting the path leave in any direction meant the exit got stripped by the template-agreement pass and the entire floor was severed from its own entrance — 12 of 13 rooms unreachable.
+2. **The boss attaches to its host's east side.** The arena has one door, on its west wall. If no path room has a free eastern neighbour, the generator walks back along the path rather than orphaning the boss.
+3. **Party placement must clear the doorway trigger by more than the spread radius.** The party lands in a 58-unit ring; with only 86 units of clearance one member spawned *inside* the door they just used and instantly transitioned back. A dead-end room traded the party back and forth every 22 ticks.
+
+**Navigation is a breadth-first search** to the nearest unvisited room, falling back to the boss. A local "not the door I came in by" heuristic is not enough — on a dead end the only door *is* the arrival door.
+
+**Bots gather at the exit but do not step through it while a human is in the party.** §2 locks doors so nobody gets dragged ahead; a bot triggering the transition would do exactly that from the other side. With an all-bot party there is nobody to wait for, so bots lead — which is also what lets the harness play a floor end to end. Bots also never leave while an ally is downed.
+
+## Camera and leash (§2)
+
+Two cameras: a **world camera** that zooms to fit the party and scrolls, and a **HUD camera** at zoom 1 so the interface doesn't shrink when the party spreads out.
+
+The zoom floor (`CAMERA.MIN_ZOOM`) is load-bearing. §16.5 and Pillar 3 both say a camera zoomed to fit four scattered players makes each one a few pixels tall — so it stops pulling back, and the leash takes over.
+
+**The leash is defined in world units from the party centroid, never as "off the rendered frame."** Frame size depends on the window, and a rule that depends on the window is not something two lockstep peers can agree on. The camera and the leash read the same `World.centroid`, so what you see and what the rules do cannot disagree.
 
 ## Juice, and the line it must not cross
 
@@ -167,6 +194,10 @@ These have been mutation-tested — injecting `Math.random` into world generatio
 Combat adds: collision keeps bodies apart (sampled every tick, not just the last one) · nothing escapes the room · the §8 stage transitions · revive needs an unbroken channel · bots revive a downed ally · a party wipe ends the run.
 
 Classes add: **every one of the twelve abilities actually fires** · the §3.2 levers each separate all four classes · a dash hits each body exactly once.
+
+Floors add: generation is seeded and reproducible, and across 40 seeds every room is reachable, every door reciprocal, and no room offers a door its template cannot draw · doors lock during combat and no transition starts mid-fight · the party makes real floor progress rather than oscillating · the leash grants its grace period and then bites gently.
+
+Checks that need a fight call `advanceToCombat` first — floors open in an enemy-free entry room, so anything about combat, collision or abilities would otherwise be measuring an empty room.
 
 Checks that isolate a mechanic call `suppressEnemies` — otherwise a rescuer standing still for a 3s channel gets beaten down and the check fails for reasons unrelated to what it tests.
 

@@ -20,15 +20,69 @@ export const SIM = {
 } as const;
 
 /**
- * The single Phase 0 room, in world units. The canvas is sized to the room
- * and scaled to fit the window, so world units *are* the design resolution
- * and nothing downstream hardcodes a pixel (constraint #5).
+ * Design resolution. The canvas is this size and scales to fit the window, so
+ * world units *are* the design resolution and nothing downstream hardcodes a
+ * pixel (constraint #5).
+ *
+ * Rooms are no longer the same size as the view — templates declare their own
+ * dimensions and the camera (§2) zooms to fit the party inside them.
  */
+export const VIEW = {
+  WIDTH: 1280,
+  HEIGHT: 720,
+} as const;
+
+/** Wall thickness — bodies are clamped inside this margin of a room. */
 export const ROOM = {
-  WIDTH: 1200,
-  HEIGHT: 660,
-  /** Wall thickness — players are clamped inside this margin. */
   WALL: 24,
+} as const;
+
+/**
+ * Doors — §2: "Doors lock during combat. Keeps the party together; prevents
+ * one player speedrunning ahead."
+ */
+export const DOOR = {
+  /** Opening width along the wall. */
+  WIDTH: 150,
+  /** How deep into the room the trigger reaches. */
+  DEPTH: 46,
+  /** Seconds a transition takes, so it reads as a move rather than a teleport. */
+  TRANSITION: 0.35,
+} as const;
+
+/**
+ * Shared camera — §2 `[DEFAULT]`: "Shared dynamic camera that zooms to fit,
+ * plus a soft leash." Split-screen on separation is `[CUT]`.
+ */
+export const CAMERA = {
+  /** Padding around the party bounds before fitting. */
+  PADDING: 260,
+  /**
+   * Zoom floor. Pillar 3 and §16.5 both say a camera zoomed to fit four
+   * scattered players makes each one a few pixels tall — so it stops, and the
+   * soft leash takes over from there.
+   */
+  MIN_ZOOM: 0.62,
+  MAX_ZOOM: 1.15,
+  /** Exponential follow rate per second. */
+  LERP: 6.5,
+} as const;
+
+/**
+ * Soft leash — §2.
+ *
+ * Deliberately defined in **world units from the party centroid**, not as
+ * "outside the rendered frame". Frame size depends on the window, and a rule
+ * that depends on the window is not something two lockstep peers can agree
+ * on. This version is identical on every machine.
+ */
+export const LEASH = {
+  /** Beyond this from the party centroid, the leash bites. */
+  RADIUS: 620,
+  /** Damage per second while outside. "Light" per §2 — a nudge, not a threat. */
+  DAMAGE_PER_SECOND: 6,
+  /** Grace period before damage starts, so a dash out is never punished. */
+  GRACE: 1.2,
 } as const;
 
 /** Party size. Four is the design target (§2) and what §13's questions need. */
@@ -199,6 +253,10 @@ export const BOT = {
   REENGAGE_HP: 0.7,
   /** How far a retreating bot wants to be from the nearest enemy. */
   RETREAT_DISTANCE: 260,
+
+  /** How far from an open door bots gather while waiting for the human. Far
+   *  enough that collision jostling cannot shove one into the trigger. */
+  DOOR_STANDOFF: 165,
 
   /**
    * A hurt bot burns its escape (dash / blink) when something is this close.

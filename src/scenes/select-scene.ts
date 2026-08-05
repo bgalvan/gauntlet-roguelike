@@ -1,6 +1,6 @@
 import Phaser from 'phaser';
 
-import { ROOM } from '../core/constants';
+import { VIEW } from '../core/constants';
 import { CLASS_ORDER, getClass } from '../game/classes';
 import { GamepadBackend } from '../input/backends/gamepad';
 import { KeyboardMouseBackend } from '../input/backends/keyboard-mouse';
@@ -50,7 +50,7 @@ export class SelectScene extends Phaser.Scene {
     this.gfx = this.add.graphics();
 
     this.title = this.add
-      .text(ROOM.WIDTH / 2, 40, 'CHOOSE YOUR CLASS', {
+      .text(VIEW.WIDTH / 2, 40, 'CHOOSE YOUR CLASS', {
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: '32px',
         color: '#e8edf6',
@@ -58,7 +58,7 @@ export class SelectScene extends Phaser.Scene {
       .setOrigin(0.5);
 
     this.add
-      .text(ROOM.WIDTH / 2, 72, 'Three allies will join you. They take the other three roles.', {
+      .text(VIEW.WIDTH / 2, 72, 'Three allies will join you. They take the other three roles.', {
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: '13px',
         color: '#6c7a91',
@@ -92,7 +92,7 @@ export class SelectScene extends Phaser.Scene {
     }
 
     this.hint = this.add
-      .text(ROOM.WIDTH / 2, ROOM.HEIGHT - 26, '', {
+      .text(VIEW.WIDTH / 2, VIEW.HEIGHT - 26, '', {
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: '15px',
         color: '#8b9bb4',
@@ -111,7 +111,7 @@ export class SelectScene extends Phaser.Scene {
   }
 
   private get cardWidth(): number {
-    return (ROOM.WIDTH - 90) / CLASS_ORDER.length - 18;
+    return (VIEW.WIDTH - 90) / CLASS_ORDER.length - 18;
   }
 
   private cardX(i: number): number {
@@ -123,7 +123,7 @@ export class SelectScene extends Phaser.Scene {
   }
 
   private get cardHeight(): number {
-    return ROOM.HEIGHT - this.cardY - 52;
+    return VIEW.HEIGHT - this.cardY - 52;
   }
 
   override update(time: number, delta: number): void {
@@ -195,7 +195,7 @@ export class SelectScene extends Phaser.Scene {
     const g = this.gfx;
     g.clear();
 
-    g.fillStyle(0x0f1218, 1).fillRect(0, 0, ROOM.WIDTH, ROOM.HEIGHT);
+    g.fillStyle(0x0f1218, 1).fillRect(0, 0, VIEW.WIDTH, VIEW.HEIGHT);
 
     for (let i = 0; i < CLASS_ORDER.length; i++) {
       const def = getClass(CLASS_ORDER[i]!);

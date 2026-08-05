@@ -1,5 +1,5 @@
 # DESIGN MANUAL — Untitled Co-op Roguelike
-**Version 0.13 · Last updated 2026-08-05**
+**Version 0.14 · Last updated 2026-08-05**
 
 > **STATUS: CANONICAL.** This document supersedes `coop-roguelike-spec.md` (v0.1) and `coop-roguelike-loot-and-party-items.md`. Both are archived; their content is folded in below. This is the single source of truth.
 
@@ -667,6 +667,18 @@ Ranked by actual impact:
 ---
 
 ## 18. CHANGELOG
+
+**v0.14 — 2026-08-05**
+- **§2 floor generation built.** Seeded room graph — critical path of 8–12 rooms plus 2–3 branches, then a boss arena — with each node populated from a hand-authored template library. Eight Act I templates so far against a target of ~40/act; adding more is content work, not engineering.
+- Templates declare door positions, spawn anchors with budget cost, a safe pocket, and hazard slots. Hazards have no system yet, so the slots are declared and unused rather than omitted — §0 says follow the schema.
+- **Doors lock during combat and open on clear**, per §2. Rooms remember being cleared, so backtracking does not respawn them.
+- **§2 shared camera built**: zooms to fit the living party, clamped to the room and to a minimum zoom. The floor is deliberate — Pillar 3 and §16.5 both veto a frame so wide that four players are a few pixels tall, so the camera stops and the leash takes over from there.
+- **Soft leash built**, with one implementation decision worth recording: it is defined in **world units from the party centroid**, not as "outside the rendered frame". Frame size varies by window, and a rule that varies by window cannot be agreed on by two lockstep peers. Light damage after a grace period, plus a directional marker home.
+- **§13 question 1 is now askable.** "Is the shared camera survivable with four players?" has a real implementation to judge; it has not been answered.
+- Party scaling now applies per room via the template's authored budget and a mild depth ramp, still scaled by party *size* rather than living players (§8's anti-death-spiral rule).
+- Bots gather at the exit but never step through it while a human is present — §2 locks doors so nobody is dragged ahead, and a bot triggering a transition is that same problem in reverse. Bots also refuse to leave a room while an ally is downed.
+- Three generation bugs found and fixed by testing rather than review: the entry's single east door could be stripped, severing the floor from its own entrance; the boss arena's single west door could be orphaned; and party placement on arrival could land a member back inside the door they came through, ping-ponging the party between two rooms forever.
+- Still deferred: an actual boss entity (§11), the shop and score economy (§10), treasure and secret rooms, items, and hazards. Balance remains untouched.
 
 **v0.13 — 2026-08-05**
 - **Four launch classes built as data** (§3.1): Warrior, Archer, Sorcerer, Valkyrie. All §3.2 levers now genuinely separate all four — movement speed, attack cadence, resource system, range, traversal, and silhouette. A harness check asserts this, so a future class that plays like an existing one fails the build.
