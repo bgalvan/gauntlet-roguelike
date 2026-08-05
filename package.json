@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vite build --config vite.determinism.config.ts --logLevel error && node .harness/determinism.mjs"
   },
   "dependencies": {
     "phaser": "^4.2.1"

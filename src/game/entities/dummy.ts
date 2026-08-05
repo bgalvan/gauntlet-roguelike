@@ -1,3 +1,4 @@
+import type { Hasher } from '../../core/checksum';
 import { DUMMY, SIM } from '../../core/constants';
 import { Entity } from './entity';
 
@@ -36,5 +37,10 @@ export class Dummy extends Entity {
     if (wasAlive && !this.alive) {
       this.respawnTicks = Math.round(DUMMY.RESPAWN_DELAY * SIM.TICK_RATE);
     }
+  }
+
+  override writeChecksum(h: Hasher): void {
+    super.writeChecksum(h);
+    h.int(this.respawnTicks).int(this.hitFlashTicks);
   }
 }

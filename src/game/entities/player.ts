@@ -1,3 +1,4 @@
+import type { Hasher } from '../../core/checksum';
 import { PLAYER, ROOM, SIM } from '../../core/constants';
 import type { InputState } from '../../input/input-state';
 import { overrideHoldTicks, selectTarget } from '../targeting';
@@ -115,5 +116,18 @@ export class Player extends Entity {
   /** True while the player is holding a manual target pick. Debug/UI only. */
   get overrideActive(): boolean {
     return this.overrideTicks > 0;
+  }
+
+  override writeChecksum(h: Hasher): void {
+    super.writeChecksum(h);
+    h.float(this.facingX)
+      .float(this.facingY)
+      .int(this.attackCooldown)
+      .int(this.overrideTicks)
+      .float(this.overrideX)
+      .float(this.overrideY)
+      // Target identity, not the object — a peer that picked a different
+      // enemy has already desynced even if positions still agree.
+      .int(this.target ? this.target.id : -1);
   }
 }

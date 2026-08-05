@@ -1,3 +1,5 @@
+import type { Hasher } from '../../core/checksum';
+
 /**
  * Base entity. Deliberately not a Phaser GameObject — the simulation must be
  * runnable with no renderer at all, both for headless determinism tests and
@@ -45,6 +47,18 @@ export abstract class Entity {
       this.hp = 0;
       this.alive = false;
     }
+  }
+
+  /**
+   * Contribute every field the simulation reads to the checksum. Subclasses
+   * must call super and then add their own — a field that affects future
+   * behaviour but is omitted here makes desyncs invisible until they've
+   * already diverged.
+   *
+   * `prevX`/`prevY` are excluded on purpose: they are render-only.
+   */
+  writeChecksum(h: Hasher): void {
+    h.int(this.id).float(this.x).float(this.y).float(this.hp).bool(this.alive);
   }
 }
 

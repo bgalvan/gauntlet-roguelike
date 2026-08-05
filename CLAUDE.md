@@ -63,6 +63,7 @@ Phase 0 exists to answer manual §13's questions. Do not expand scope past the s
 |---|---|
 | `npm install` | Install dependencies |
 | `npm run dev` | Vite dev server with HMR — http://localhost:5173 |
+| `npm test` | Determinism harness — headless, no browser |
 | `npm run typecheck` | `tsc --noEmit` (strict) |
 | `npm run build` | Typecheck, then production bundle to `dist/` |
 | `npm run preview` | Serve the built `dist/` locally |
@@ -75,13 +76,25 @@ No linter yet — TypeScript is in strict mode with `noUnusedLocals`, `noUncheck
 
 ```
 src/
-  core/        constants · rng · fixed-loop      — engine-agnostic
+  core/        constants · rng · fixed-loop · checksum   — engine-agnostic
   input/       input-state · input-manager · backends/{keyboard-mouse,gamepad}
   game/        world · targeting · entities/{entity,player,dummy}
-  scenes/      game-scene.ts                     — the only Phaser-aware file besides main.ts
+  scenes/      game-scene.ts                             — the only Phaser-aware file besides main.ts
+test/
+  determinism.ts                                         — run with `npm test`
 ```
 
 **The rule that keeps constraints #1 and #3 honest:** `src/game/` and `src/core/` import no Phaser and read no DOM. The simulation runs headless; the scene renders it. Input crosses the boundary only as `InputState`. If a `import Phaser` ever appears under `game/`, something has gone wrong.
+
+## Determinism
+
+`World.checksum()` hashes every field the simulation reads — positions by exact IEEE-754 bits, plus the RNG state. This is not test scaffolding: lockstep peers exchange it periodically to catch desync on the tick it happens (§16.3, §16.7).
+
+**When you add a field that affects future behaviour, add it to that entity's `writeChecksum`.** A field the checksum ignores reports agreement while peers silently diverge — worse than having no checksum.
+
+`npm test` covers: same seed + same inputs → identical 1800-tick trace · framerate independence across 60/144/30/stuttering frame patterns · seeds actually differ · `Math.random` is trapped and never called during a sim run · PRNG reproducibility, state round-trip, fork independence · the checksum notices a one-ULP drift.
+
+These have been mutation-tested — injecting `Math.random` into world generation, and leaking real frame time into the sim `dt`, both fail the suite. The `dt` mutation notably still *passes* at 60fps and only fails at 144fps.
 
 ## Working rules
 
