@@ -35,6 +35,10 @@ export class Enemy extends Entity {
   /** Render-only. */
   hitFlashTicks = 0;
 
+  /** Whether this corpse has had its drop rolled (§7.2). Set once, so a body
+   *  cannot pay out twice however many ticks it spends dead in the room. */
+  looted = false;
+
   constructor(id: number, x: number, y: number) {
     super(id, x, y, ENEMY.RADIUS, ENEMY.MAX_HP);
   }
@@ -170,6 +174,9 @@ export class Enemy extends Entity {
       .int(this.cooldownTicks)
       .int(this.committedTargetId)
       .float(this.facingX)
-      .float(this.facingY);
+      .float(this.facingY)
+      // The drop roll consumes the room's RNG stream, so whether it has
+      // happened yet decides every later draw in the room.
+      .bool(this.looted);
   }
 }

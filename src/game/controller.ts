@@ -2,6 +2,7 @@ import type { Hasher } from '../core/checksum';
 import type { InputState } from '../input/input-state';
 import { clearInputState, copyInputState } from '../input/input-state';
 import type { Entity } from './entities/entity';
+import type { Pickup } from './entities/pickup';
 import type { Player } from './entities/player';
 
 /**
@@ -35,6 +36,9 @@ export interface RoomBounds {
    * human in the party there is nobody to wait for, so bots lead.
    */
   readonly botsLead: boolean;
+  /** Hearts on the floor (§7.2). Hearts are the only healing in the game, so
+   *  a controller that ignored them would have no answer to attrition. */
+  readonly pickups: readonly Pickup[];
 }
 
 export interface PlayerController {
@@ -48,6 +52,19 @@ export interface PlayerController {
     room: RoomBounds,
     out: InputState,
   ): void;
+
+  /**
+   * Answer a pending §4 upgrade offer: 0 for the first direction, 1 for the
+   * second.
+   *
+   * Optional because a human answers with the input they already produce —
+   * the offer reads `moveVector` to move the highlight and the context action
+   * to commit, so no fifth binding appears (constraint #2). A bot has no
+   * input for a menu, so it decides here instead, from world state plus its
+   * own forked PRNG. Same rule as its movement: peers derive the identical
+   * choice without exchanging anything.
+   */
+  chooseUpgrade?(self: Player, optionA: number, optionB: number): number;
 
   /** Contribute any state that affects future input to the desync checksum.
    *  A bot's RNG belongs here; a human's does not exist. */

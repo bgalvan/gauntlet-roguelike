@@ -1,5 +1,5 @@
 import type { Hasher } from '../core/checksum';
-import { BOT, DEATH, PLAYER, ROOM } from '../core/constants';
+import { BOT, DEATH, PICKUP, PLAYER, ROOM, UPGRADE } from '../core/constants';
 import type { Rng } from '../core/rng';
 import type { InputState } from '../input/input-state';
 import { clampToUnit } from '../input/input-state';
@@ -8,6 +8,7 @@ import type { AbilityDef } from './classes';
 import type { PlayerController, RoomBounds } from './controller';
 import { distanceSq } from './entities/entity';
 import type { Entity } from './entities/entity';
+import type { Pickup } from './entities/pickup';
 import type { Player } from './entities/player';
 import { LifeState } from './life-state';
 
@@ -48,9 +49,22 @@ export class BotController implements PlayerController {
   /** Entity id of the ally this bot has committed to reviving, or -1. */
   private rescueTargetId = -1;
 
+  /**
+   * Which side of an axis this bot leans toward — 0 for the first direction,
+   * 1 for the second — drawn once and then kept.
+   *
+   * Re-deciding each offer is the obvious implementation and it defeats the
+   * point of §4: spreading picks evenly across an axis never reaches three
+   * stacks, so no bot ever crosses a breakpoint and the transformations go
+   * untested. Committing produces builds, which is the behaviour the system
+   * exists to produce and the only way the harness sees a capstone fire.
+   */
+  private readonly lean: number;
+
   constructor(rng: Rng) {
     this.rng = rng;
     this.strafeSign = this.rng.chance(0.5) ? 1 : -1;
+    this.lean = this.rng.chance(0.5) ? 0 : 1;
   }
 
   produceInput(
@@ -137,6 +151,26 @@ export class BotController implements PlayerController {
     const target = nearestLiving(self, enemies);
     this.useAbilities(self, target, enemies, out);
 
+    // Hearts are the whole healing economy now that WAVE.CLEAR_HEAL is gone
+    // (§7.2). A bot that ignored them would kite on 30hp for the rest of the
+    // floor and then hand the harness an attrition wipe that measures nothing.
+    // Only once the fight is over, or while already disengaged — crossing a
+    // live room for a pickup is how you arrive at it downed.
+    if (!target || this.retreating) {
+      const heart = nearestHeart(self, room);
+      if (heart) {
+        const hx = heart.x - self.x;
+        const hy = heart.y - self.y;
+        const hd = Math.hypot(hx, hy);
+        if (hd > 1) {
+          steerX += hx / hd;
+          steerY += hy / hd;
+          this.applySteering(self, steerX, steerY, allies, room, out);
+          return;
+        }
+      }
+    }
+
     if (target) {
       const dx = target.x - self.x;
       const dy = target.y - self.y;
@@ -150,7 +184,7 @@ export class BotController implements PlayerController {
         // made three of the four classes fight like the fourth.
         const standoff = this.retreating
           ? BOT.RETREAT_DISTANCE
-          : self.def.attackRange * BOT.STANDOFF;
+          : self.stats.attackRange * BOT.STANDOFF;
 
         if (dist > standoff + BOT.TOLERANCE) {
           steerX += towardX;
@@ -199,6 +233,25 @@ export class BotController implements PlayerController {
     this.applySteering(self, steerX, steerY, allies, room, out);
   }
 
+  // --- §4 upgrades ---------------------------------------------------------
+
+  /**
+   * Answer an offer.
+   *
+   * Follows this bot's lean, except when that side is already capped — a
+   * capped direction is not a choice, and taking it would silently discard
+   * the pick. Deterministic: no PRNG draw here at all, so peers reach the
+   * same build without exchanging anything, and adding this cannot shift any
+   * other system's stream.
+   */
+  chooseUpgrade(self: Player, optionA: number, optionB: number): number {
+    const preferred = this.lean === 1 ? optionB : optionA;
+    const other = this.lean === 1 ? optionA : optionB;
+    if ((self.stacks[preferred] ?? 0) < UPGRADE.MAX_STACKS) return this.lean;
+    if ((self.stacks[other] ?? 0) < UPGRADE.MAX_STACKS) return this.lean === 1 ? 0 : 1;
+    return this.lean;
+  }
+
   // --- abilities -----------------------------------------------------------
 
   /**
@@ -220,27 +273,33 @@ export class BotController implements PlayerController {
     out: InputState,
   ): void {
     const payoff = self.def.abilities[2]!;
-    const payoffCost = payoff.spendsAll ? self.def.resource.max : payoff.cost;
+    const payoffCost = self.abilityCost(2);
 
     /**
-     * Hold the resource when the room already warrants the payoff but the
-     * pool is short.
+     * Hold the resource whenever the room warrants the payoff.
      *
      * Without this the signature drains the pool on cooldown and the payoff
      * literally never fires: the Sorcerer spent mana on Blast at 67 and fell
      * back to 35, so Deep Freeze's full pool was unreachable, and the Valkyrie
      * bled stamina into Block so Slam never came up. Measured — both were
      * dead code until this rule existed. It is also just correct play.
+     *
+     * The condition deliberately does **not** also require the pool to be
+     * short. Buttons are pressed for every slot in one pass, but Player spends
+     * them in slot order — so on the one tick the pool finally reached full,
+     * the signature was still pressed, spent 32 of the 100 first, and the
+     * payoff found itself unaffordable again. A payoff that is only ever
+     * unaffordable on the exact tick it becomes affordable never fires at all.
      */
     const savingForPayoff =
-      payoffCost > 0 &&
-      self.resource < payoffCost &&
-      this.abilityCondition(self, payoff, target, enemies);
+      payoffCost > 0 && this.abilityCondition(self, payoff, target, enemies);
 
     for (let slot = 0; slot < 3; slot++) {
       const def = self.def.abilities[slot]!;
 
-      const cost = def.spendsAll ? self.def.resource.max : def.cost;
+      // Costs come off the player, not the class table: a Mana Pool build
+      // pays a bigger bill for the same payoff (§4).
+      const cost = self.abilityCost(slot);
       if (cost > 0 && self.resource < cost) continue;
       // Slot 2 is the only one that ever yields to the payoff; slot 1 is
       // traversal and free, slot 3 *is* the payoff.
@@ -272,7 +331,7 @@ export class BotController implements PlayerController {
       case AbilityId.Plow:
         // Gap closers: only worth it when there is a gap, and never while
         // running away — charging into the swarm you are fleeing is suicide.
-        return !this.retreating && targetDist > self.def.attackRange * 1.4 && targetDist < def.distance * 1.5;
+        return !this.retreating && targetDist > self.stats.attackRange * 1.4 && targetDist < def.distance * 1.5;
 
       case AbilityId.Dash:
       case AbilityId.Blink:
@@ -298,7 +357,7 @@ export class BotController implements PlayerController {
         // §3.3 slot 2 is "rhythm" — the Valkyrie's is holding ground. Blocking
         // halves movement, so only while something is actually close, and only
         // with stamina to spare.
-        return targetDist < self.def.attackRange * 1.2 && self.resourceFraction > 0.3;
+        return targetDist < self.stats.attackRange * 1.2 && self.resourceFraction > 0.3;
 
       // --- Slot 3: payoff --------------------------------------------------
       case AbilityId.Shockwave:
@@ -534,6 +593,7 @@ export class BotController implements PlayerController {
   writeChecksum(h: Hasher): void {
     h.int(this.rng.getState())
       .int(this.age)
+      .int(this.lean)
       .int(this.strafeSign)
       .bool(this.retreating)
       .int(this.rescueTargetId)
@@ -570,6 +630,34 @@ function countWithin(x: number, y: number, radius: number, enemies: readonly Ent
     if (dx * dx + dy * dy <= radiusSq) n++;
   }
   return n;
+}
+
+/**
+ * The heart this bot should go and take, or null.
+ *
+ * Null when the bot is not actually missing health: §7.3's rule is that a
+ * heart is left for whoever needs it, and a bot at full HP walking onto one
+ * would be the accidental pickup that rule exists to prevent — just performed
+ * deliberately.
+ */
+function nearestHeart(self: Player, room: RoomBounds): Pickup | null {
+  if (self.maxHp - self.hp < PICKUP.MIN_MISSING_HP) return null;
+
+  let best: Pickup | null = null;
+  let bestDistSq = Infinity;
+  for (let i = 0; i < room.pickups.length; i++) {
+    const p = room.pickups[i]!;
+    if (p.taken) continue;
+    const dx = p.x - self.x;
+    const dy = p.y - self.y;
+    const distSq = dx * dx + dy * dy;
+    // Ties broken by id so every peer sends the same bot to the same heart.
+    if (distSq < bestDistSq || (distSq === bestDistSq && best !== null && p.id < best.id)) {
+      best = p;
+      bestDistSq = distSq;
+    }
+  }
+  return best;
 }
 
 /** Nearest living enemy at any distance — bots walk to a fight, they don't

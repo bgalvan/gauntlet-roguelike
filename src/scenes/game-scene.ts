@@ -1,6 +1,17 @@
 import Phaser from 'phaser';
 
-import { COMBAT, DEATH, DOOR, ENEMY, LEASH, PARTY_SIZE, ROOM, SIM, VIEW } from '../core/constants';
+import {
+  COMBAT,
+  DEATH,
+  DOOR,
+  ENEMY,
+  LEASH,
+  PARTY_SIZE,
+  ROOM,
+  SIM,
+  UPGRADE,
+  VIEW,
+} from '../core/constants';
 import { FixedLoop } from '../core/fixed-loop';
 import { AbilityId, CLASS_ORDER, ClassId } from '../game/classes';
 import type { ClassDef } from '../game/classes';
@@ -11,6 +22,7 @@ import { EventKind } from '../game/events';
 import { LifeState } from '../game/life-state';
 import { RoomKind } from '../game/rooms/floor';
 import { Direction } from '../game/rooms/templates';
+import { TRANSFORMATION_BLURB, axesFor, capstoneOf, directionsFor } from '../game/upgrades';
 import type { DoorInstance } from '../game/world';
 import { World } from '../game/world';
 import { GamepadBackend } from '../input/backends/gamepad';
@@ -63,6 +75,14 @@ export class GameScene extends Phaser.Scene {
   private readonly abilityLabels: Phaser.GameObjects.Text[] = [];
   private readonly abilityKeys: Phaser.GameObjects.Text[] = [];
   private readonly damageNumbers: DamageNumber[] = [];
+
+  /** §4 offer card: a title, two option cards, and the input hint. */
+  private offerTitle!: Phaser.GameObjects.Text;
+  private readonly offerNames: Phaser.GameObjects.Text[] = [];
+  private readonly offerBlurbs: Phaser.GameObjects.Text[] = [];
+  private offerHint!: Phaser.GameObjects.Text;
+  /** §4.3: each player's build, readable from across the screen. */
+  private readonly buildLabels: Phaser.GameObjects.Text[] = [];
 
   private shake = 0;
   private shakeX = 0;
@@ -153,6 +173,67 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setDepth(21);
     hudObjects.push(this.roomText);
+
+    // §4 offer card. Built once and hidden, like everything else in the HUD —
+    // allocating Text objects on a room clear would hitch the frame the reward
+    // lands on, which is the worst possible frame to hitch.
+    this.offerTitle = this.add
+      .text(VIEW.WIDTH / 2, VIEW.HEIGHT / 2 - 116, '', {
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: '15px',
+        color: '#8b9bb4',
+      })
+      .setOrigin(0.5)
+      .setDepth(32);
+    hudObjects.push(this.offerTitle);
+
+    for (let i = 0; i < 2; i++) {
+      const name = this.add
+        .text(0, 0, '', {
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: '19px',
+          color: '#e8edf6',
+        })
+        .setOrigin(0.5)
+        .setDepth(32);
+      const blurb = this.add
+        .text(0, 0, '', {
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: '11px',
+          color: '#8b9bb4',
+          align: 'center',
+          wordWrap: { width: OFFER_CARD_W - 26 },
+          lineSpacing: 4,
+        })
+        .setOrigin(0.5, 0)
+        .setDepth(32);
+      this.offerNames.push(name);
+      this.offerBlurbs.push(blurb);
+      hudObjects.push(name, blurb);
+    }
+
+    this.offerHint = this.add
+      .text(VIEW.WIDTH / 2, VIEW.HEIGHT / 2 + 132, '', {
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: '11px',
+        color: '#5d6879',
+      })
+      .setOrigin(0.5)
+      .setDepth(32);
+    hudObjects.push(this.offerHint);
+
+    for (let i = 0; i < PARTY_SIZE; i++) {
+      const label = this.add
+        .text(0, 0, '', {
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: '9px',
+          color: '#8b9bb4',
+        })
+        .setOrigin(0.5)
+        .setDepth(22);
+      this.buildLabels.push(label);
+      hudObjects.push(label);
+    }
 
     this.banner = this.add
       .text(VIEW.WIDTH / 2, VIEW.HEIGHT / 2, '', {
@@ -307,6 +388,26 @@ export class GameScene extends Phaser.Scene {
         case EventKind.Blocked:
           this.particles.burst(e.x, e.y, e.dirX, e.dirY, 6, { color: 0xa8d0ff, speed: 160 });
           break;
+
+        case EventKind.Pickup:
+          this.particles.ring(e.x, e.y, 12, { color: 0x6fd08c, speed: 170, life: 0.5 });
+          audio.revived();
+          break;
+
+        case EventKind.Upgrade:
+          this.particles.ring(e.x, e.y, 14, { color: this.slotColor(e.slot), speed: 190, life: 0.55 });
+          audio.uiConfirm();
+          break;
+
+        // §4.1: a breakpoint hands over a *new behaviour*, not a bigger
+        // number. It is the one moment in the upgrade flow worth selling, so
+        // it gets the payoff treatment rather than the confirm blip.
+        case EventKind.Breakpoint:
+          this.particles.shockRing(e.x, e.y, 120, this.slotColor(e.slot), 0.7);
+          this.particles.ring(e.x, e.y, 26, { color: 0xffd98b, speed: 300, life: 0.8 });
+          this.addShake(5);
+          audio.payoff();
+          break;
       }
     }
 
@@ -418,6 +519,8 @@ export class GameScene extends Phaser.Scene {
 
     this.particles.draw(g);
 
+    this.drawPickups(g);
+
     for (const enemy of this.world.enemies) this.drawEnemy(g, enemy, alpha);
 
     for (const shot of this.world.projectiles) {
@@ -495,6 +598,35 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  /**
+   * Hearts on the floor (§7.2).
+   *
+   * Drawn as a shape rather than a recoloured dot, for the same reason the
+   * classes have silhouettes: Pillar 1 asks that things be identifiable
+   * without relying on colour.
+   */
+  private drawPickups(g: Phaser.GameObjects.Graphics): void {
+    const pulse = 1 + 0.09 * Math.sin(this.time.now * 0.006);
+    for (const pickup of this.world.pickups) {
+      if (pickup.taken) continue;
+      const r = pickup.radius * pulse;
+
+      g.fillStyle(0x000000, 0.3).fillCircle(pickup.x, pickup.y + 3, r * 0.9);
+      g.fillStyle(0x6fd08c, 1);
+      g.fillCircle(pickup.x - r * 0.42, pickup.y - r * 0.25, r * 0.56);
+      g.fillCircle(pickup.x + r * 0.42, pickup.y - r * 0.25, r * 0.56);
+      g.fillTriangle(
+        pickup.x - r * 0.95,
+        pickup.y - r * 0.02,
+        pickup.x + r * 0.95,
+        pickup.y - r * 0.02,
+        pickup.x,
+        pickup.y + r * 1.05,
+      );
+      g.lineStyle(1.5, 0xb8ecc8, 0.8).strokeCircle(pickup.x, pickup.y, r * 1.25);
+    }
+  }
+
   private drawEnemy(g: Phaser.GameObjects.Graphics, enemy: Enemy, alpha: number): void {
     const x = lerp(enemy.prevX, enemy.x, alpha);
     const y = lerp(enemy.prevY, enemy.y, alpha);
@@ -546,7 +678,9 @@ export class GameScene extends Phaser.Scene {
 
     this.drawTargetMarker(g, player.target, alpha, player.overrideActive);
 
-    if (isLocal) g.lineStyle(1, 0x3a4557, 0.45).strokeCircle(x, y, def.attackRange);
+    // The *live* range — upgrades move it, and a reticle drawn from the class
+    // table would quietly lie to a player who took Reach.
+    if (isLocal) g.lineStyle(1, 0x3a4557, 0.45).strokeCircle(x, y, player.stats.attackRange);
 
     if (player.blocking) {
       const facing = Math.atan2(player.facingY, player.facingX);
@@ -675,7 +809,7 @@ export class GameScene extends Phaser.Scene {
     g.fillStyle(0x6fd08c, 1).fillRect(barX, barY, barW * Math.max(0, player.hp / player.maxHp), 12);
     g.lineStyle(1, 0x3a4557, 1).strokeRect(barX, barY, barW, 12);
 
-    if (def.resource.max > 0) {
+    if (player.stats.resourceMax > 0) {
       g.fillStyle(0x1b2029, 1).fillRect(barX, barY + 16, barW, 7);
       g.fillStyle(resourceColor(def), 1).fillRect(barX, barY + 16, barW * player.resourceFraction, 7);
       g.lineStyle(1, 0x3a4557, 1).strokeRect(barX, barY + 16, barW, 7);
@@ -691,7 +825,7 @@ export class GameScene extends Phaser.Scene {
       const ability = def.abilities[i]!;
       const x = startX + i * (slotSize + gap);
       const cd = player.cooldownFraction(i);
-      const cost = ability.spendsAll ? def.resource.max : ability.cost;
+      const cost = player.abilityCost(i);
       const affordable = cost === 0 || player.resource >= cost;
       const ready = cd <= 0 && affordable;
 
@@ -718,6 +852,7 @@ export class GameScene extends Phaser.Scene {
 
     this.drawPartyStrip(g);
     this.drawMinimap(g);
+    this.drawOffer(g);
 
     const node = this.world.room;
     const kindLabel =
@@ -735,6 +870,7 @@ export class GameScene extends Phaser.Scene {
     this.hud.setText([
       `${def.name.toUpperCase()}  ·  ${def.role}`,
       `seed ${String(this.world.seed)}  room ${this.world.currentRoom}/${this.world.floor.rooms.length - 1}  tick ${this.world.tick}  ${Math.round(this.game.loop.actualFps)}fps`,
+      `dmg ${player.stats.attackDamage.toFixed(1)}  range ${Math.round(player.stats.attackRange)}  picks ${this.world.upgradesTaken}`,
       ``,
       `WASD  move`,
       `mouse / right-stick  retarget`,
@@ -744,16 +880,17 @@ export class GameScene extends Phaser.Scene {
 
   private drawPartyStrip(g: Phaser.GameObjects.Graphics): void {
     const stripW = 118;
+    const stripH = 44;
     const start = VIEW.WIDTH / 2 - (stripW * PARTY_SIZE + 8 * (PARTY_SIZE - 1)) / 2;
     for (let i = 0; i < this.world.party.length; i++) {
       const p = this.world.party[i]!.player;
       const x = start + i * (stripW + 8);
       const y = 42;
 
-      g.fillStyle(0x000000, 0.4).fillRoundedRect(x, y, stripW, 26, 5);
+      g.fillStyle(0x000000, 0.4).fillRoundedRect(x, y, stripW, stripH, 5);
       const isLocal = !p.botControlled;
       g.lineStyle(isLocal ? 2 : 1, isLocal ? 0xffffff : 0x2b3242, isLocal ? 0.7 : 1);
-      g.strokeRoundedRect(x, y, stripW, 26, 5);
+      g.strokeRoundedRect(x, y, stripW, stripH, 5);
 
       drawSilhouette(g, p.def.silhouette, x + 15, y + 13, 8, 1, 0, p.def.color, p.def.rim,
         p.life === LifeState.Alive ? 1 : 0.35);
@@ -765,11 +902,152 @@ export class GameScene extends Phaser.Scene {
       g.fillStyle(0x151a22, 1).fillRect(x + 27, y + 10, w, 7);
       g.fillStyle(color, 1).fillRect(x + 27, y + 10, w * Math.max(0, frac), 7);
 
+      this.drawBuildPips(g, p, x + 27, y + 22, w);
+
+      // §4.3: "Choices must be visible to the party. If the Sorcerer commits
+      // to AoE, the Warrior can go Reach to complement — that's the co-op
+      // layer this system unlocks, and it's free if the information is on
+      // screen." The capstone is the part worth reading at a glance.
+      const label = this.buildLabels[i]!;
+      const capstone = capstoneOf(p.def.id, p.stacks);
+      const choosing = this.world.offerFor(i) !== null;
+      label.setPosition(x + stripW / 2, y + stripH + 8);
+      label.setText(choosing ? 'CHOOSING…' : (capstone ?? ''));
+      label.setColor(choosing ? '#ffd98b' : `#${p.def.rim.toString(16).padStart(6, '0')}`);
+
       // Leash warning on the strip, so you can tell *who* is straying.
       if (this.world.leashOvershoot(i) > 0) {
-        g.lineStyle(2, 0xffb347, 0.9).strokeRoundedRect(x, y, stripW, 26, 5);
+        g.lineStyle(2, 0xffb347, 0.9).strokeRoundedRect(x, y, stripW, stripH, 5);
       }
     }
+  }
+
+  /**
+   * One bar per axis, filling left or right from the centre by how many
+   * stacks that direction holds (§4.3's branch indicator).
+   *
+   * Ticks mark the breakpoints, because a player who cannot see where 3 is
+   * cannot plan for it — and planning for it is the entire difference between
+   * a build and a slider (§4.1).
+   */
+  private drawBuildPips(
+    g: Phaser.GameObjects.Graphics,
+    player: Player,
+    x: number,
+    y: number,
+    width: number,
+  ): void {
+    const axes = axesFor(player.def.id);
+    const gap = 3;
+    const cell = (width - gap * (axes.length - 1)) / axes.length;
+    const half = cell / 2 - 1;
+
+    for (let a = 0; a < axes.length; a++) {
+      const left = x + a * (cell + gap);
+      const mid = left + cell / 2;
+      const aStacks = player.stacks[a * 2] ?? 0;
+      const bStacks = player.stacks[a * 2 + 1] ?? 0;
+
+      g.fillStyle(0x151a22, 1).fillRect(left, y, cell, 5);
+
+      if (aStacks > 0) {
+        const fill = (Math.min(aStacks, UPGRADE.MAX_STACKS) / UPGRADE.MAX_STACKS) * half;
+        g.fillStyle(player.def.color, 1).fillRect(mid - fill, y, fill, 5);
+      }
+      if (bStacks > 0) {
+        const fill = (Math.min(bStacks, UPGRADE.MAX_STACKS) / UPGRADE.MAX_STACKS) * half;
+        g.fillStyle(player.def.rim, 1).fillRect(mid, y, fill, 5);
+      }
+
+      const breakpointOffset = (UPGRADE.BREAKPOINT_1 / UPGRADE.MAX_STACKS) * half;
+      g.fillStyle(0x0d0d12, 0.9);
+      g.fillRect(mid - breakpointOffset, y, 1, 5);
+      g.fillRect(mid + breakpointOffset, y, 1, 5);
+      g.fillStyle(0x3a4557, 1).fillRect(mid - 0.5, y - 1, 1, 7);
+    }
+  }
+
+  /**
+   * The §4 offer card.
+   *
+   * Two directions, one highlighted, chosen with the movement axis and
+   * committed with the context action — **no fifth binding** (constraint #2).
+   * A menu is where a four-input budget usually springs a leak, and it is the
+   * one place the leak would look harmless.
+   */
+  private drawOffer(g: Phaser.GameObjects.Graphics): void {
+    const offer = this.world.offerFor(0);
+    const visible = offer !== null;
+
+    this.offerTitle.setVisible(visible);
+    this.offerHint.setVisible(visible);
+    for (let i = 0; i < 2; i++) {
+      this.offerNames[i]!.setVisible(visible);
+      this.offerBlurbs[i]!.setVisible(visible);
+    }
+    if (!offer) return;
+
+    const player = this.world.localPlayer;
+    const dirs = directionsFor(player.def.id);
+    const cx = VIEW.WIDTH / 2;
+    const cy = VIEW.HEIGHT / 2;
+
+    g.fillStyle(0x05070b, 0.72).fillRect(0, 0, VIEW.WIDTH, VIEW.HEIGHT);
+
+    this.offerTitle.setText(`${player.def.name.toUpperCase()}  ·  CHOOSE A DIRECTION`);
+
+    for (let i = 0; i < 2; i++) {
+      const dir = dirs[i === 0 ? offer.a : offer.b];
+      if (!dir) continue;
+      const stacks = player.stacks[i === 0 ? offer.a : offer.b] ?? 0;
+      const chosen = offer.highlight === i;
+      const x = cx + (i === 0 ? -OFFER_CARD_W - 12 : 12);
+      const y = cy - OFFER_CARD_H / 2;
+
+      g.fillStyle(chosen ? 0x141a25 : 0x0e1219, 0.96);
+      g.fillRoundedRect(x, y, OFFER_CARD_W, OFFER_CARD_H, 8);
+      g.lineStyle(chosen ? 3 : 1.5, chosen ? player.def.rim : 0x2b3242, 1);
+      g.strokeRoundedRect(x, y, OFFER_CARD_W, OFFER_CARD_H, 8);
+
+      this.offerNames[i]!.setPosition(x + OFFER_CARD_W / 2, y + 26);
+      this.offerNames[i]!.setText(dir.name);
+      this.offerNames[i]!.setColor(chosen ? '#ffffff' : '#8b9bb4');
+
+      // What the *next* stack buys, spelled out. §13's fourth question is
+      // whether a binary pick feels meaningful or like a stat point, and a
+      // card that only shows a name cannot be answered honestly either way.
+      const next = stacks + 1;
+      const lines = [dir.blurb];
+      if (next === UPGRADE.BREAKPOINT_1 && dir.at3) {
+        lines.push('', `▸ ${TRANSFORMATION_BLURB[dir.at3][0]}`);
+      } else if (next === UPGRADE.BREAKPOINT_2 && dir.at6) {
+        lines.push('', `▸ ${dir.capstone.toUpperCase()}`, TRANSFORMATION_BLURB[dir.at6][1]);
+      } else if (dir.at3) {
+        const toGo = (next < UPGRADE.BREAKPOINT_1 ? UPGRADE.BREAKPOINT_1 : UPGRADE.BREAKPOINT_2) - next;
+        if (toGo > 0) lines.push('', `${toGo} more → ${next < UPGRADE.BREAKPOINT_1 ? TRANSFORMATION_BLURB[dir.at3][0] : dir.capstone}`);
+      }
+      lines.push('', `${stacks} → ${next} of ${UPGRADE.MAX_STACKS}`);
+
+      this.offerBlurbs[i]!.setPosition(x + OFFER_CARD_W / 2, y + 48);
+      this.offerBlurbs[i]!.setText(lines.join('\n'));
+      this.offerBlurbs[i]!.setColor(chosen ? '#c3ccdb' : '#5d6879');
+
+      // Stack pips along the foot of the card.
+      for (let k = 0; k < UPGRADE.MAX_STACKS; k++) {
+        const px = x + OFFER_CARD_W / 2 - (UPGRADE.MAX_STACKS * 13) / 2 + k * 13 + 4;
+        const py = y + OFFER_CARD_H - 20;
+        const held = k < stacks;
+        const gaining = k === stacks;
+        g.fillStyle(held ? player.def.color : gaining && chosen ? player.def.rim : 0x2b3242, 1);
+        g.fillCircle(px, py, k + 1 === UPGRADE.BREAKPOINT_1 || k + 1 === UPGRADE.BREAKPOINT_2 ? 5 : 3.5);
+      }
+    }
+
+    const secondsLeft = Math.max(
+      0,
+      Math.ceil((UPGRADE.AUTO_CONFIRM_SECONDS * SIM.TICK_RATE - offer.age) / SIM.TICK_RATE),
+    );
+    this.offerHint.setText(`A / D or left stick  ·  E to commit  ·  auto in ${secondsLeft}s`);
   }
 
   /** Floor map (§2): the graph, with visited rooms filled and the boss marked. */
@@ -845,6 +1123,9 @@ export class GameScene extends Phaser.Scene {
 }
 
 const KEY_HINTS = ['SPACE', 'RMB', 'SHIFT'] as const;
+
+const OFFER_CARD_W = 260;
+const OFFER_CARD_H = 210;
 
 const PAYOFF_IDS: ReadonlySet<string> = new Set([
   AbilityId.Shockwave,
