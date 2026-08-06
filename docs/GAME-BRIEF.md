@@ -51,6 +51,8 @@ Pick the same direction three times and your class doesn't just get better numbe
 
 Twelve to fourteen choices per run. No two Sorcerers come out the same.
 
+*Built.* All four classes have three axes and six directions, the breakpoints at three and six stacks are in, and the party can see each other's branches — which is the point: if the Sorcerer commits to blast radius, the Warrior can go reach to complement.
+
 ### 2. Weapons are sidegrades, not upgrades
 
 Each class has multiple weapons that are genuinely different — not better and worse.
@@ -113,6 +115,8 @@ Two currencies, kept apart. **Gold** buys things and resets each run. **Score** 
 Two classes (Warrior, Archer), one act, one boss, 15 items, local four-player. Ugly on purpose.
 
 *It exists to answer four questions:* Is a shared camera survivable with four players? Does the loot rule create fun arguments or real resentment? Is a full room readable with four players' effects on screen? Does a binary upgrade choice feel meaningful or like a stat point?
+
+*Where it stands:* four classes and twelve abilities, seeded floors with locked doors and a shared camera, the death system, and the upgrade axes are all playable. Questions one, three and four are now askable — none of them is answered. The boss, the shop, the item pool and weapon sidegrades are not built.
 
 **Vertical slice.** Four classes, two acts, four bosses, two weapons each, full loot tiers.
 

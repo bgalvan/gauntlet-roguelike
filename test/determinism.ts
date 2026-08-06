@@ -11,13 +11,30 @@
  */
 
 import { Hasher } from '../src/core/checksum';
-import { DEATH, ENEMY, LEASH, PARTY_SIZE, PLAYER, ROOM, SIM } from '../src/core/constants';
+import {
+  DEATH,
+  ENEMY,
+  LEASH,
+  PARTY_SIZE,
+  PLAYER,
+  ROOM,
+  SIM,
+  UPGRADE,
+} from '../src/core/constants';
 import { FixedLoop } from '../src/core/fixed-loop';
 import { Rng } from '../src/core/rng';
 import { CLASS_ORDER, ClassId, getClass } from '../src/game/classes';
 import { Enemy } from '../src/game/entities/enemy';
+import { Pickup, PickupKind } from '../src/game/entities/pickup';
 import { EventKind } from '../src/game/events';
 import { LifeState, lifeStateName } from '../src/game/life-state';
+import {
+  allDirections,
+  axesFor,
+  deriveStats,
+  directionsFor,
+  tierOf,
+} from '../src/game/upgrades';
 import { World } from '../src/game/world';
 import type { InputState } from '../src/input/input-state';
 import { clampToUnit, makeInputState } from '../src/input/input-state';
@@ -1240,6 +1257,554 @@ export function checkPartyWipeEndsRun(): CheckResult {
 }
 
 /** Smallest representable increase — one unit in the last place. */
+// ---------------------------------------------------------------------------
+// §4 — bi-directional upgrades
+// ---------------------------------------------------------------------------
+
+/** Give a player `n` stacks in one direction, the way the game would. */
+function stack(player: { applyUpgrade(i: number): void }, index: number, n: number): void {
+  for (let i = 0; i < n; i++) player.applyUpgrade(index);
+}
+
+/** A room with exactly the bodies a check wants, and nothing else. */
+function clearRoom(world: World): void {
+  suppressEnemies(world);
+  world.step(SIM.STEP_SECONDS);
+  world.enemies.length = 0;
+  world.pickups.length = 0;
+}
+
+function addDummy(world: World, id: number, x: number, y: number, hp = 100000): Enemy {
+  const e = new Enemy(id, x, y);
+  e.hp = hp;
+  e.maxHp = hp;
+  world.enemies.push(e);
+  return e;
+}
+
+function countHitEvents(world: World): number {
+  let n = 0;
+  for (let i = 0; i < world.events.length; i++) {
+    const kind = world.events.at(i).kind;
+    if (kind === EventKind.Hit || kind === EventKind.Kill) n++;
+  }
+  return n;
+}
+
+export function checkPartyReachesBreakpoints(): CheckResult {
+  // The end-to-end one, and deliberately non-vacuous: a party that was offered
+  // upgrades but never answered them, or answered them by spreading picks
+  // evenly across an axis, would satisfy every other check in this section
+  // while §4.1's breakpoints stayed dead code for the whole run.
+  const world = new World('upgrade-progress', 0);
+
+  let peakStack = 0;
+  let transformed = 0;
+  for (let t = 0; t < 12000 && !world.runOver && !world.floorComplete; t++) {
+    world.step(SIM.STEP_SECONDS);
+  }
+
+  for (const p of world.players) {
+    for (let i = 0; i < p.stacks.length; i++) peakStack = Math.max(peakStack, p.stacks[i]!);
+    for (const t of p.stats.tiers) if (t > 0) transformed++;
+  }
+
+  const pass = world.upgradesTaken > 0 && peakStack >= UPGRADE.BREAKPOINT_1 && transformed > 0;
+  return {
+    name: '§4 the party picks upgrades and crosses breakpoints',
+    pass,
+    detail: pass
+      ? `${world.upgradesTaken} picks over ${world.roomsCleared} rooms; deepest line ${peakStack} stacks, ${transformed} transformations live`
+      : `${world.upgradesTaken} picks, deepest line ${peakStack} stacks, ${transformed} transformations — no build formed`,
+  };
+}
+
+export function checkEveryDirectionGrantsItsBreakpoints(): CheckResult {
+  // §4.1's breakpoints are the mechanism that turns a slider into a build. A
+  // direction whose at3/at6 never reached the stat block would look like a
+  // working upgrade and quietly be a stat point.
+  //
+  // Enumerated from the axis data rather than a hardcoded list, so a direction
+  // added later cannot be silently untested — the same reason the ability
+  // check reads the class table.
+  const broken: string[] = [];
+  let checked = 0;
+
+  for (const classId of CLASS_ORDER) {
+    const def = getClass(classId);
+    const dirs = directionsFor(classId);
+
+    for (let i = 0; i < dirs.length; i++) {
+      const dir = dirs[i]!;
+      checked++;
+
+      const at1: number[] = new Array<number>(dirs.length).fill(0);
+      at1[i] = UPGRADE.BREAKPOINT_1;
+      const at2: number[] = new Array<number>(dirs.length).fill(0);
+      at2[i] = UPGRADE.BREAKPOINT_2;
+
+      const below: number[] = new Array<number>(dirs.length).fill(0);
+      below[i] = UPGRADE.BREAKPOINT_1 - 1;
+
+      const s0 = deriveStats(def, below);
+      const s1 = deriveStats(def, at1);
+      const s2 = deriveStats(def, at2);
+
+      if (dir.at3) {
+        if (tierOf(s0, dir.at3) !== 0) broken.push(`${dir.id} granted ${dir.at3} early`);
+        if (tierOf(s1, dir.at3) < 1) broken.push(`${dir.id} missing ${dir.at3} at 3`);
+      }
+      if (dir.at6 && tierOf(s2, dir.at6) < 2) {
+        broken.push(`${dir.id} missing capstone ${dir.at6} at 6`);
+      }
+      if (!dir.capstone) broken.push(`${dir.id} has no capstone name`);
+    }
+  }
+
+  return {
+    name: '§4.1 every direction grants its breakpoints',
+    pass: broken.length === 0,
+    detail:
+      broken.length === 0
+        ? `${checked} directions across ${CLASS_ORDER.length} classes reach 3 and 6`
+        : broken.slice(0, 3).join('; '),
+  };
+}
+
+export function checkAxisPoolsRotate(): CheckResult {
+  // §4.1 fix 2. Three axes per class, both halves distinct, and every axis
+  // reachable from a draw — a pool that always returned the same pair is the
+  // slider the whole section exists to avoid.
+  const problems: string[] = [];
+
+  for (const classId of CLASS_ORDER) {
+    const axes = axesFor(classId);
+    if (axes.length < 3) problems.push(`${classId} has ${axes.length} axes`);
+
+    const ids = new Set<string>();
+    for (const axis of axes) {
+      if (axis.a.id === axis.b.id) problems.push(`${axis.id} offers the same direction twice`);
+      ids.add(axis.a.id);
+      ids.add(axis.b.id);
+    }
+    if (ids.size !== axes.length * 2) problems.push(`${classId} reuses a direction id`);
+  }
+
+  // Every direction id in the game must be globally unique — they index a
+  // player's stack array, and a collision would silently merge two builds.
+  const all = allDirections();
+  const unique = new Set(all.map((d) => d.id));
+  if (unique.size !== all.length) problems.push(`${all.length - unique.size} duplicate ids`);
+
+  // A run's offers must actually visit more than one axis, or the rotation is
+  // decorative. Measured over a real floor rather than by inspecting rollOffer.
+  const world = new World('axis-rotation', 0);
+  const seenAxes = new Set<string>();
+  const before = world.players.map((p) => p.stacks.slice());
+  for (let t = 0; t < 12000 && !world.runOver && !world.floorComplete; t++) {
+    world.step(SIM.STEP_SECONDS);
+  }
+  for (let i = 0; i < world.players.length; i++) {
+    const p = world.players[i]!;
+    const axes = axesFor(p.def.id);
+    for (let a = 0; a < axes.length; a++) {
+      const moved =
+        p.stacks[a * 2]! !== before[i]![a * 2]! || p.stacks[a * 2 + 1]! !== before[i]![a * 2 + 1]!;
+      if (moved) seenAxes.add(`${p.def.id}:${axes[a]!.id}`);
+    }
+  }
+  if (seenAxes.size < 2) problems.push(`offers only ever landed on ${seenAxes.size} axis`);
+
+  return {
+    name: '§4.1 axis pools are distinct and rotate',
+    pass: problems.length === 0,
+    detail:
+      problems.length === 0
+        ? `${all.length} unique directions; a floor drew ${seenAxes.size} different axes`
+        : problems.slice(0, 3).join('; '),
+  };
+}
+
+export function checkDerivedStatsAreRecomputed(): CheckResult {
+  // Constraint #3, the quiet half. Stats are recomputed from the class base
+  // every time rather than multiplied into a stored field. Accumulating
+  // `value *= 1.09` six times is a float-drift source, and two peers who took
+  // the same upgrades in a different frame order would end up with genuinely
+  // different damage — a desync that positions alone would never reveal.
+  const def = getClass(ClassId.Warrior);
+  const dirs = directionsFor(ClassId.Warrior);
+
+  // Applied one pick at a time through the real path...
+  const player = new World('stat-drift', PARTY_SIZE).localPlayer;
+  stack(player, 1, UPGRADE.BREAKPOINT_2);
+  stack(player, 4, 2);
+
+  // ...against the same stacks derived in one shot.
+  const stacks: number[] = new Array<number>(dirs.length).fill(0);
+  stacks[1] = UPGRADE.BREAKPOINT_2;
+  stacks[4] = 2;
+  const oneShot = deriveStats(def, stacks);
+
+  const exact =
+    player.stats.attackDamage === oneShot.attackDamage &&
+    player.stats.maxHp === oneShot.maxHp &&
+    player.stats.abilityPower === oneShot.abilityPower &&
+    player.stats.damageTaken === oneShot.damageTaken;
+
+  // And deriving twice must be bit-identical, not merely close.
+  const again = deriveStats(def, stacks);
+  const stable =
+    again.attackDamage === oneShot.attackDamage && again.attackRange === oneShot.attackRange;
+
+  // Non-vacuous: the stacks have to have moved something in the first place.
+  const moved = oneShot.attackDamage > def.attackDamage;
+
+  const pass = exact && stable && moved;
+  return {
+    name: '§4 derived stats are recomputed, never accumulated',
+    pass,
+    detail: pass
+      ? `8 sequential picks match a single derive exactly (${def.attackDamage} → ${oneShot.attackDamage.toFixed(4)} damage)`
+      : `incremental ${player.stats.attackDamage} vs one-shot ${oneShot.attackDamage} (stable ${stable}, moved ${moved})`,
+  };
+}
+
+export function checkTransformationsChangeCombat(): CheckResult {
+  // Every one of the seven §4 verbs has to *do* something. A transformation
+  // that reached the stat block but was never read at a call site is the worst
+  // kind of dead content: the HUD announces a new behaviour and nothing
+  // happens. One focused scenario per verb, each measuring the behaviour
+  // rather than the flag.
+  const dead: string[] = [];
+  const evidence: string[] = [];
+
+  // --- Cleave, melee: one swing, three bodies in the arc -------------------
+  {
+    const world = new World('tf-cleave', PARTY_SIZE, [ClassId.Warrior, ClassId.Warrior, ClassId.Warrior, ClassId.Warrior]);
+    const user = world.localPlayer;
+    clearRoom(world);
+    user.facingX = 1;
+    user.facingY = 0;
+    addDummy(world, 9001, user.x + 60, user.y);
+    addDummy(world, 9002, user.x + 55, user.y - 40);
+    addDummy(world, 9003, user.x + 55, user.y + 40);
+
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+    const baseline = countHitEvents(world);
+
+    stack(user, 0, UPGRADE.BREAKPOINT_1); // Warrior Reach
+    let cleaved = 0;
+    for (let t = 0; t < 90 && cleaved <= baseline; t++) {
+      world.setInput(0, NEUTRAL);
+      world.step(SIM.STEP_SECONDS);
+      cleaved = Math.max(cleaved, countHitEvents(world));
+    }
+    if (cleaved > baseline) evidence.push(`cleave ${baseline}→${cleaved} bodies`);
+    else dead.push('cleave');
+  }
+
+  // --- Cleave, projectile: the Archer's Multishot fans extra shots ---------
+  {
+    const world = new World('tf-fan', PARTY_SIZE, [ClassId.Archer, ClassId.Archer, ClassId.Archer, ClassId.Archer]);
+    const user = world.localPlayer;
+    clearRoom(world);
+    addDummy(world, 9101, user.x + 150, user.y);
+    stack(user, 3, UPGRADE.BREAKPOINT_1); // Archer Multishot
+
+    let peak = 0;
+    for (let t = 0; t < 60; t++) {
+      world.setInput(0, NEUTRAL);
+      world.step(SIM.STEP_SECONDS);
+      let live = 0;
+      for (const shot of world.projectiles) if (shot.active && shot.ownerSlot === 0) live++;
+      peak = Math.max(peak, live);
+    }
+    if (peak >= 3) evidence.push(`multishot ${peak} arrows in flight`);
+    else dead.push('cleave/projectile');
+  }
+
+  // --- Pierce: one arrow, two bodies ---------------------------------------
+  {
+    const world = new World('tf-pierce', PARTY_SIZE, [ClassId.Archer, ClassId.Archer, ClassId.Archer, ClassId.Archer]);
+    const user = world.localPlayer;
+    clearRoom(world);
+    const near = addDummy(world, 9201, user.x + 120, user.y);
+    const far = addDummy(world, 9202, user.x + 200, user.y);
+    user.facingX = 1;
+    user.facingY = 0;
+    stack(user, 2, UPGRADE.BREAKPOINT_1); // Archer Pierce
+
+    for (let t = 0; t < 90; t++) {
+      world.setInput(0, NEUTRAL);
+      world.step(SIM.STEP_SECONDS);
+    }
+    const both = near.hp < near.maxHp && far.hp < far.maxHp;
+    if (both) evidence.push('pierce reached the body behind');
+    else dead.push('pierce');
+  }
+
+  // --- Field: an area ability leaves a burning zone ------------------------
+  {
+    const world = new World('tf-field', PARTY_SIZE, [ClassId.Sorcerer, ClassId.Sorcerer, ClassId.Sorcerer, ClassId.Sorcerer]);
+    const user = world.localPlayer;
+    clearRoom(world);
+    addDummy(world, 9301, user.x + 100, user.y);
+    stack(user, 0, UPGRADE.BREAKPOINT_1); // Sorcerer Blast Radius
+
+    const press = makeInputState();
+    press.ability[1]!.down = true;
+    press.ability[1]!.pressed = true;
+    world.setInput(0, press);
+    world.step(SIM.STEP_SECONDS);
+
+    if (user.activeZones.length > 0) evidence.push('field left behind a blast');
+    else dead.push('field');
+  }
+
+  // --- Burst: a kill damages the bodies around the corpse ------------------
+  {
+    const world = new World('tf-burst', PARTY_SIZE, [ClassId.Warrior, ClassId.Warrior, ClassId.Warrior, ClassId.Warrior]);
+    const user = world.localPlayer;
+    clearRoom(world);
+    user.facingX = 1;
+    user.facingY = 0;
+    stack(user, 1, UPGRADE.BREAKPOINT_1); // Warrior Force
+
+    // The bystander sits **outside** the Warrior's own reach and inside the
+    // detonation radius, so any damage it takes can only have come from the
+    // corpse. Measuring "more than a basic attack" instead would compare two
+    // numbers the upgrade moves at the same time.
+    const doomed = addDummy(world, 9401, user.x + 90, user.y, 1);
+    const bystander = addDummy(world, 9402, user.x + 90 + UPGRADE.BURST_RADIUS[0]! * 0.6, user.y);
+    const outOfReach = bystander.x - user.x > user.stats.attackRange + bystander.radius;
+
+    for (let t = 0; t < 120 && doomed.alive; t++) {
+      world.setInput(0, NEUTRAL);
+      world.step(SIM.STEP_SECONDS);
+    }
+    const splash = bystander.maxHp - bystander.hp;
+    if (outOfReach && splash > 0) evidence.push(`burst splashed ${splash.toFixed(1)} past the corpse`);
+    else dead.push('burst');
+  }
+
+  // --- Surge: landing hits shortens the ability cooldown -------------------
+  {
+    // Run the identical scenario with and without the stacks and compare, so
+    // the measurement does not depend on knowing how many swings land in the
+    // window. Surge also shortens the attack interval, which is exactly the
+    // kind of second-order help an absolute threshold would misread.
+    const remaining = (stacks: number): number => {
+      const world = new World('tf-surge', PARTY_SIZE, [ClassId.Warrior, ClassId.Warrior, ClassId.Warrior, ClassId.Warrior]);
+      const user = world.localPlayer;
+      clearRoom(world);
+      user.facingX = 1;
+      user.facingY = 0;
+      addDummy(world, 9501, user.x + 60, user.y);
+      if (stacks > 0) stack(user, 2, stacks); // Warrior Rage Generation
+
+      const press = makeInputState();
+      press.ability[1]!.down = true;
+      press.ability[1]!.pressed = true;
+      world.setInput(0, press);
+      world.step(SIM.STEP_SECONDS);
+
+      for (let t = 0; t < 120; t++) {
+        world.setInput(0, NEUTRAL);
+        world.step(SIM.STEP_SECONDS);
+      }
+      return user.cooldownFraction(1);
+    };
+
+    const base = remaining(0);
+    const surged = remaining(UPGRADE.BREAKPOINT_2);
+    if (surged < base - 0.02) {
+      evidence.push(`surge left ${(surged * 100).toFixed(0)}% of a cooldown where base left ${(base * 100).toFixed(0)}%`);
+    } else {
+      dead.push('surge');
+    }
+  }
+
+  // --- Aegis: an ally standing close takes less --------------------------
+  {
+    const world = new World('tf-aegis', PARTY_SIZE, [ClassId.Warrior, ClassId.Warrior, ClassId.Warrior, ClassId.Warrior]);
+    const shelter = world.localPlayer;
+    const ally = world.party[1]!.player;
+    clearRoom(world);
+    stack(shelter, 4, UPGRADE.BREAKPOINT_1); // Warrior Armor
+
+    ally.x = shelter.x + 30;
+    ally.y = shelter.y;
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+    const sheltered = ally.auraDamageFactor;
+
+    ally.x = shelter.x + UPGRADE.AEGIS_RADIUS[0]! * 3;
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+    const exposed = ally.auraDamageFactor;
+
+    if (sheltered < 1 && exposed === 1) {
+      evidence.push(`aegis ${(1 - sheltered) * 100}% inside the radius, nothing outside`);
+    } else {
+      dead.push('aegis');
+    }
+  }
+
+  // --- Stance: holding still is worth damage -------------------------------
+  {
+    // Melee rather than the Archer: a projectile in flight carries the damage
+    // it was launched with, so a shot fired while walking can land during the
+    // stationary phase and be read as the stationary number.
+    const world = new World('tf-stance', PARTY_SIZE, [ClassId.Valkyrie, ClassId.Valkyrie, ClassId.Valkyrie, ClassId.Valkyrie]);
+    const user = world.localPlayer;
+    clearRoom(world);
+    const dummy = addDummy(world, 9701, user.x + 70, user.y);
+    stack(user, 4, UPGRADE.BREAKPOINT_1); // Valkyrie Self — the stationary side
+
+    const lastHit = (): number => {
+      let amount = 0;
+      for (let i = 0; i < world.events.length; i++) {
+        const e = world.events.at(i);
+        if (e.kind === EventKind.Hit && e.slot === 0 && e.amount > 0) amount = e.amount;
+      }
+      return amount;
+    };
+
+    const walking = makeInputState();
+    walking.moveVector.x = -1;
+    let movingDamage = 0;
+    for (let t = 0; t < 180 && movingDamage === 0; t++) {
+      // Held in place so the dummy stays in reach; only the *intent* to move
+      // matters, which is what the stance reads.
+      user.x = dummy.x - 70;
+      user.y = dummy.y;
+      world.setInput(0, walking);
+      world.step(SIM.STEP_SECONDS);
+      movingDamage = lastHit() || movingDamage;
+    }
+
+    let stillDamage = 0;
+    for (let t = 0; t < 240 && stillDamage === 0; t++) {
+      user.x = dummy.x - 70;
+      user.y = dummy.y;
+      world.setInput(0, NEUTRAL);
+      world.step(SIM.STEP_SECONDS);
+      if (t >= UPGRADE.STANCE_SETTLE_TICKS) stillDamage = lastHit() || stillDamage;
+    }
+
+    if (movingDamage > 0 && stillDamage > movingDamage) {
+      evidence.push(`stance ${movingDamage.toFixed(1)}→${stillDamage.toFixed(1)} standing still`);
+    } else {
+      dead.push('stance');
+    }
+  }
+
+  return {
+    name: '§4 every transformation changes combat',
+    pass: dead.length === 0,
+    detail:
+      dead.length === 0
+        ? evidence.join(' · ')
+        : `no observable effect: ${dead.join(', ')}`,
+  };
+}
+
+export function checkOffersHoldTheDoors(): CheckResult {
+  // §4.3 wants the picks visible to the party, which only works if everyone is
+  // looking at the same moment — so a pending offer keeps the doors shut, the
+  // same lever §2 uses for combat. And because it holds the doors, it must be
+  // impossible for it to hold them forever: one player stepping away from the
+  // keyboard cannot be allowed to end a run for four people.
+  // One human slot that never answers, three bots that do. The bots clear the
+  // room; the human's unanswered pick is what holds the doors.
+  const world = new World('offer-doors', 1);
+  advanceToCombat(world);
+  let sawOffer = false;
+  let doorOpenDuringOffer = false;
+  let transitionDuringOffer = false;
+  let resolvedAtTick = -1;
+
+  for (let t = 0; t < 6000 && resolvedAtTick < 0; t++) {
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+
+    if (world.offerPending) {
+      sawOffer = true;
+      for (const door of world.doors) if (door.open) doorOpenDuringOffer = true;
+      if (world.transitionTicks > 0) transitionDuringOffer = true;
+    } else if (sawOffer) {
+      resolvedAtTick = world.tick;
+    }
+  }
+
+  const timedOut = resolvedAtTick > 0;
+  const pass = sawOffer && !doorOpenDuringOffer && !transitionDuringOffer && timedOut;
+
+  return {
+    name: '§4 a pending offer bars the doors, and cannot stall the run',
+    pass,
+    detail: pass
+      ? `doors stayed barred through the offer; an unanswered pick auto-confirmed and reopened them`
+      : `saw offer ${sawOffer}, door opened ${doorOpenDuringOffer}, transitioned ${transitionDuringOffer}, resolved ${timedOut}`,
+  };
+}
+
+export function checkHeartsGoToTheHurt(): CheckResult {
+  // §7.2 puts hearts in the free-for-all, touch-pickup tier — no ceremony.
+  // §7.3 then asks for the one piece of friction that matters: accidental
+  // pickup in a crowded room is the most common source of co-op loot
+  // resentment, and it is a UX defect rather than a design tradeoff. So a
+  // player at full health walks over a heart and leaves it.
+  //
+  // This also stands in for WAVE.CLEAR_HEAL, which healed the party a flat 35%
+  // the instant a room fell because nothing else could heal at all.
+  const world = new World('hearts', PARTY_SIZE);
+  clearRoom(world);
+
+  const healthy = world.localPlayer;
+  const hurt = world.party[1]!.player;
+  hurt.hp = hurt.maxHp * 0.4;
+  const hurtBefore = hurt.hp;
+
+  // Park a heart under the player who does not need it.
+  const heart = new Pickup(9800, PickupKind.Heart, healthy.x, healthy.y);
+  world.pickups.push(heart);
+  for (let t = 0; t < 12; t++) {
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+  }
+  const survivedFullHp = !heart.taken && healthy.hp === healthy.maxHp;
+
+  // Now walk the hurt one onto it.
+  hurt.x = heart.x;
+  hurt.y = heart.y;
+  for (let t = 0; t < 12 && !heart.taken; t++) {
+    world.setInput(0, NEUTRAL);
+    world.step(SIM.STEP_SECONDS);
+  }
+  const healed = hurt.hp - hurtBefore;
+  const takenByHurt = heart.taken && heart.takenBy === hurt.slot && healed > 0;
+
+  // And a cleared room actually pays out, since that is what replaced the
+  // scaffolding heal.
+  const floor = new World('heart-payout', 0);
+  let dropped = 0;
+  for (let t = 0; t < 12000 && dropped === 0 && !floor.runOver; t++) {
+    floor.step(SIM.STEP_SECONDS);
+    if (floor.roomsCleared > 0) dropped = floor.pickups.length;
+  }
+
+  const pass = survivedFullHp && takenByHurt && dropped > 0;
+  return {
+    name: '§7.2 hearts are free-for-all, and only the hurt take them',
+    pass,
+    detail: pass
+      ? `a full-health player walked over it; the hurt one healed ${healed.toFixed(0)}hp; a cleared room dropped ${dropped}`
+      : `left at full hp ${survivedFullHp}, taken by the hurt ${takenByHurt}, room payout ${dropped}`,
+  };
+}
+
 function nextAfter(value: number): number {
   const buf = new DataView(new ArrayBuffer(8));
   buf.setFloat64(0, value);
@@ -1278,6 +1843,13 @@ export const CHECKS = [
   checkControllerInputIsCleared,
   checkRescuerDoesNotThrash,
   checkPartyWipeEndsRun,
+  checkPartyReachesBreakpoints,
+  checkEveryDirectionGrantsItsBreakpoints,
+  checkAxisPoolsRotate,
+  checkDerivedStatsAreRecomputed,
+  checkTransformationsChangeCombat,
+  checkOffersHoldTheDoors,
+  checkHeartsGoToTheHurt,
 ] as const;
 
 export function runAll(): CheckResult[] {

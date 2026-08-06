@@ -54,7 +54,9 @@ When a design decision is made in a session, update the manual and add a changel
 
 **Phase 3 — floors, doors and the shared camera. DONE.** Hand-authored room templates, a seeded layout graph with a critical path plus branches, doors that lock during combat, room transitions, the §2 shared camera, and the soft leash.
 
-Still absent, in rough dependency order: items and the upgrade axes (§4) · weapon sidegrades (§5) · an actual boss entity (§11 — the arena exists, it currently holds an oversized wave) · the shop and score economy (§10) · treasure and secret rooms · act 2+ templates and hazards · the Necromancer (post-launch unlock per §3.1).
+**Phase 4 — upgrades and pickups. DONE.** The §4 bi-directional upgrade system with all three of §4.1's fixes, 24 axis directions across the four classes, seven breakpoint transformations, the §4.3 branch indicators, and §7.2 tier-1 heart pickups replacing the `WAVE.CLEAR_HEAL` scaffolding.
+
+Still absent, in rough dependency order: weapon sidegrades (§5) · an actual boss entity (§11 — the arena exists, it currently holds an oversized wave) · the shop and score economy (§10, which also unblocks §4.3's Reforge) · the §9 item pool and party items · treasure and secret rooms · act 2+ templates and hazards · the Necromancer (post-launch unlock per §3.1).
 
 **Ask before expanding scope past the current milestone.**
 
@@ -80,14 +82,16 @@ No linter yet — TypeScript is in strict mode with `noUnusedLocals`, `noUncheck
 src/
   core/        constants · rng · fixed-loop · checksum      — engine-agnostic
   input/       input-state · input-manager · backends/{keyboard-mouse,gamepad}
-  game/        world · classes · abilities · targeting · collision
+  game/        world · classes · abilities · upgrades       — §4 axes are data
+               targeting · collision
                controller · bot · life-state · events
-               rooms/{templates,floor}                     — §2 generation
-               entities/{entity,player,enemy,projectile}   — no Phaser, no DOM
-  render/      silhouette · particles · audio · camera     — render-only helpers
-  scenes/      select-scene · game-scene                   — Phaser-aware
+               rooms/{templates,floor}                      — §2 generation
+               entities/{entity,player,enemy,projectile,pickup}
+                                                            — no Phaser, no DOM
+  render/      silhouette · particles · audio · camera      — render-only helpers
+  scenes/      select-scene · game-scene                    — Phaser-aware
 test/
-  determinism.ts                                           — run with `npm test`
+  determinism.ts                                            — run with `npm test`
 ```
 
 **The rule that keeps constraints #1 and #3 honest:** `src/game/` and `src/core/` import no Phaser and read no DOM. The simulation runs headless; the scenes render it. Input crosses the boundary only as `InputState`. If an `import Phaser` ever appears under `game/`, something has gone wrong.
@@ -96,7 +100,7 @@ test/
 
 Class definitions are **data**, in `src/game/classes.ts` — §3.1 asks that adding a class be content work, not engineering. A `ClassDef` carries the §3.2 levers (HP, move speed, attack cadence, range, attack style, resource) plus exactly three `AbilityDef`s. The tuple is fixed-length by type, which is how constraint #2's four-input budget is enforced at compile time.
 
-Ability *behaviour* is keyed by id in `src/game/abilities.ts`. A new class reusing existing ability kinds touches only `classes.ts`.
+Ability *behaviour* is keyed by id in `src/game/abilities.ts`. A new class reusing existing ability kinds touches only `classes.ts`. Its §4 upgrade axes are data too, in `upgrades.ts` — a class reusing existing breakpoint behaviours needs no code in either file.
 
 | | Warrior | Archer | Sorcerer | Valkyrie |
 |---|---|---|---|---|
@@ -108,6 +112,34 @@ Ability *behaviour* is keyed by id in `src/game/abilities.ts`. A new class reusi
 **Known contradiction, flagged not resolved:** §3.2 gives the Archer no resource ("pure skill"), but §3.3 says slot 3 is resource-gated. The Archer's payoff runs on a long cooldown instead. Bobby's call.
 
 Bots use all twelve. `checkAllAbilitiesFire` asserts it — three of four classes would otherwise be untested, and untested is where every bug so far has lived. Bots also **hold their resource when the room already warrants the payoff**; without that rule the signature drained the pool on cooldown and Deep Freeze and Shield Slam literally never fired.
+
+## Upgrades (§4)
+
+Axes are **data**, in `src/game/upgrades.ts`, the same way classes are. Four classes × 3 axes × 2 directions = 24 directions. Adding one is content work.
+
+**The stat rule.** Nothing reads a number off the `ClassDef` during play. `player.def` is the base; `player.stats` is the base with every stack applied. Reading `def.attackDamage` at a call site silently ignores every upgrade the player took, and does so without failing any test that did not already know to look.
+
+`deriveStats` is a pure function of (class, stacks) and is **recomputed from the base on every pick, never accumulated in place.** Compounding `value *= 1.09` into a stored field is a float-drift source, and two peers who took the same upgrades in a different frame order would end up with genuinely different damage — a desync positions alone would never reveal.
+
+**Breakpoints are the system** (§4.1). At 3 and 6 stacks a direction hands over a *behaviour*, not a bigger number. Seven of them — cleave · pierce · field · burst · surge · aegis · stance — shared across the 24 directions rather than one per direction, which is §5.2's multiplication argument applied to upgrades. A direction's two breakpoints need not be the same verb: the Sorcerer's Attack Power line goes pierce at 3 and corpse-detonation at 6, transcribed from §4.1 literally.
+
+`checkTransformationsChangeCombat` runs one focused scenario per verb and measures the *behaviour*, not the flag. A transformation that reached the stat block but was never read at a call site is the worst kind of dead content — the HUD announces a new behaviour and nothing happens.
+
+Three things learned building it:
+
+1. **A pending offer bars the doors, and must therefore time out.** Barring them is what makes the picks simultaneous, which is what makes them visible to each other (§4.3). But anything that can hold the doors must not hold them forever — one player away from the keyboard would end the run for four.
+2. **The menu costs no new binding.** Movement moves the highlight, the context action commits. Constraint #2's four-input budget is exactly the kind of thing that springs a leak in a menu, where it looks harmless.
+3. **Bots commit to one side of an axis and stay committed.** Re-deciding per offer spreads picks evenly, never reaches three stacks, and leaves every transformation untested. Same failure shape as per-tick rescuer election.
+
+Offers are only dealt once the room is clear *and* nobody is Downed — otherwise the build choice and the 3s revive channel would land on the same button.
+
+## Pickups (§7.2)
+
+Hearts drop from corpses and from cleared rooms. Free-for-all, touch pickup — §7.2 puts them in the tier where "ceremony here is pure friction", so there is no hold-to-take and no claim window.
+
+One rule from §7.3: **a heart is not consumed by a player at full health.** Accidental pickup in a crowded room is the most common source of co-op loot resentment and it is a UX defect, not a design tradeoff. Bots follow the same rule rather than a special case.
+
+This replaced `WAVE.CLEAR_HEAL`, which healed the party a flat 35% on room clear because nothing in the game could heal at all. There is a real healing economy now and it has to be walked to.
 
 ## Floors, rooms and doors (§2)
 
@@ -179,7 +211,7 @@ Two rules the code follows that are easy to break by accident:
 - **Enemies ignore Downed players.** §8's design rule is that anything piling on when the party is already losing is a death spiral. It also makes reviving a real option rather than a trap.
 - **Wave size scales with party *size*, never living players** — same reason.
 
-`WAVE.CLEAR_HEAL` is **sandbox scaffolding, not balance.** Nothing heals yet (no pickups, shop, or items), so continuous waves guarantee an attrition wipe. Delete it when §2's room-clear rewards exist.
+`WAVE.CLEAR_HEAL` is **gone** — §2's room-clear rewards exist now, so the scaffolding it stood in for was deleted. Healing is heart pickups (§7.2), which have to be walked to.
 
 ## Determinism
 
@@ -196,6 +228,8 @@ Combat adds: collision keeps bodies apart (sampled every tick, not just the last
 Classes add: **every one of the twelve abilities actually fires** · the §3.2 levers each separate all four classes · a dash hits each body exactly once.
 
 Floors add: generation is seeded and reproducible, and across 40 seeds every room is reachable, every door reciprocal, and no room offers a door its template cannot draw · doors lock during combat and no transition starts mid-fight · the party makes real floor progress rather than oscillating · the leash grants its grace period and then bites gently.
+
+Upgrades add: a real party crosses breakpoints over a floor rather than merely collecting picks · every one of the 24 directions grants its 3- and 6-stack transformations and none of them early · axis pools are distinct, ids unique, and a floor's offers visit more than one axis · **stats are recomputed rather than accumulated** — eight sequential picks must equal a single derive exactly, not approximately · **every one of the seven transformations measurably changes combat** · a pending offer bars the doors and then cannot stall the run · a heart is left by a player at full health and taken by a hurt one, and a cleared room pays out.
 
 Checks that need a fight call `advanceToCombat` first — floors open in an enemy-free entry room, so anything about combat, collision or abilities would otherwise be measuring an empty room.
 

@@ -1,5 +1,5 @@
 # DESIGN MANUAL — Untitled Co-op Roguelike
-**Version 0.14 · Last updated 2026-08-05**
+**Version 0.15 · Last updated 2026-08-06**
 
 > **STATUS: CANONICAL.** This document supersedes `coop-roguelike-spec.md` (v0.1) and `coop-roguelike-loot-and-party-items.md`. Both are archived; their content is folded in below. This is the single source of truth.
 
@@ -176,6 +176,9 @@ Reach ↔ Force and Blast Radius ↔ Attack Power are Bobby's original axes and 
 - **Regret is real.** A wrong pick on floor 2 rides for 35 minutes. Add a rare **Reforge** shop item that flips one prior choice. Don't allow free respec — commitment is the mechanic.
 - **Choices must be visible to the party.** Small branch indicator under each player's health bar. If the Sorcerer commits to AoE, the Warrior can go Reach to complement — that's the co-op layer this system unlocks, and it's free if the information is on screen.
 - **Upgrade cadence:** ~1 per floor plus 1 per boss. 12–14 choices per run. `[DEFAULT]`
+- **Prototype cadence — 1 per cleared combat room `[OPEN]`.** The figure above assumes a full run of six or so floors. The prototype has one, so it would grant two choices and put the 3-stack breakpoint out of reach entirely, which makes §13's question 4 unanswerable. Built at one per cleared combat room (~9–12 a floor) so a build actually forms. Restore the cadence above when there is more than one floor to spend it over — or decide that the shorter cadence is the right one, which is a live possibility given §13's own note that breakpoints may need to arrive earlier than stack 3.
+- **The choice bars the doors, and times out after 8s `[DEFAULT]`.** Barring the doors is what makes the picks simultaneous, which is what makes them visible to each other — the co-op layer this section is asking for. The timeout is the necessary counterweight: anything that can hold the doors must not be able to hold them forever.
+- **Implementation note.** The seven behaviours the breakpoints hand out are shared across the 24 directions rather than authored one per direction — §5.2's multiplication argument applied to upgrades. A direction's 3- and 6-stack breakpoints do not have to be the same behaviour; the Sorcerer's Attack Power line above is the model.
 
 ---
 
@@ -259,6 +262,7 @@ Every co-op loot system gets two of: **speed**, **fairness**, **meaning**. Free-
 Result: **6–10 real loot conversations per run instead of 60 trivial ones.** Scarcity makes them matter.
 
 ### 7.3 Required supporting mechanics
+- **Tier 1 built.** Hearts drop from corpses and cleared rooms, free-for-all and touch-pickup, and are **not consumed by a player at full health** — the smallest possible version of the rule below, applied where it costs nothing. Gold, keys and bombs are unbuilt; they need the shop.
 - **Hold-to-take (0.4–0.6s) on significant items.** Cheapest high-value fix in the design. Most co-op loot resentment is accidental pickup in a crowded room — a UX defect, not a design tradeoff.
 - **Transfer verb.** Any player can drop a held item; any player can take it. Makes every decision reversible, which collapses the stakes of a bad call.
 - **Visible holdings.** Item icons under each health bar. For *social pressure*, not information. Does more anti-griefing work than any hard rule, and hard rules punish friends more than griefers.
@@ -455,6 +459,8 @@ If (4) is "stat point," breakpoints (§4.1) need to arrive earlier than stack 3.
 7. Class-item drop channel (§7.5) — decide before authoring the item pool.
 8. Necromancer death interaction (§6.3).
 9. Title.
+10. Upgrade cadence in a short run (§4.3). One pick per cleared combat room is what makes breakpoints reachable on a single floor; §4.3's own figure is one per floor. Which is the real cadence depends on how many floors a run ends up having, and on the answer to §13's question 4.
+11. Whether capstone divergence (§4.1 fix 3) is genuinely a separate one-time choice, or — as built — the 6-stack breakpoint with a name on it.
 
 ---
 
@@ -667,6 +673,23 @@ Ranked by actual impact:
 ---
 
 ## 18. CHANGELOG
+
+**v0.15 — 2026-08-06**
+- **§4 bi-directional upgrades built**, with all three of §4.1's fixes rather than just the binary choice. Axes are data (`src/game/upgrades.ts`), the same way classes are — adding one is content work.
+- **§4.2 axis pools implemented for all four launch classes** — 3 axes, 6 directions each, 24 in total. The Necromancer's pool is authored in the manual but not built; it is a post-launch unlock.
+- **Breakpoint transformations at 3 and 6 stacks** (§4.1 fix 1, "the important one"). Seven behaviours — cleave, pierce, field, burst, surge, aegis, stance — shared across the 24 directions rather than authored one per direction. §5.2's argument applies to upgrades too: depth comes from multiplying a small set of verbs. The Sorcerer's four breakpoints are transcribed from §4.1 literally, including the fact that Attack Power goes pierce at 3 and corpse-detonation at 6 — a direction's two breakpoints need not be the same verb.
+- **Capstone divergence folded into the 6-stack breakpoint** (§4.1 fix 3) rather than built as a separate system: at 6 the direction is named, the HUD shows the name across the party strip, and the transformation reaches its second tier. A separate capstone layer would be a fourth thing to balance for the same result. `[DEFAULT]` — say if the one-time transformation was meant to be its own choice.
+- **Rotating axis pairs** (§4.1 fix 2): each offer draws an axis from the class's pool, preferring not to repeat the last one.
+- **§4.3's visibility requirement built.** A branch indicator under every player's health bar shows the balance of each axis with the breakpoints ticked, and a capstone reads as a name. This is the co-op layer §4.3 identifies, and it is free once the information is on screen.
+- **Upgrade cadence is sandbox tuning, flagged.** §4.3 asks for ~1 per floor plus 1 per boss, which assumes six floors. The prototype has one, so that cadence would grant two picks and a breakpoint at 3 stacks would be unreachable — leaving §13's question 4 unanswerable. It pays out per cleared combat room instead (~9–12 a floor). Restore the §4.3 cadence when there is more than one floor to spend it over. **Bobby's call.**
+- **A pending offer bars the doors**, using §2's existing lever, so the party chooses at the same moment and can see each other's picks. Because it bars the doors it also auto-confirms after 8s — an offer that can hold the doors forever lets one player away from the keyboard end a run for four. §7.2 reaches for the same device (a *skippable* claim window) for shared loot.
+- **The choice costs no new binding.** Movement moves the highlight, the context action commits. Constraint #2's four-input budget holds through a menu, which is exactly where that budget usually springs a leak.
+- **§7.2 tier-1 pickups built.** Hearts drop from corpses and from cleared rooms, free-for-all and touch-pickup, with §7.3's one piece of friction: a heart is not consumed by a player at full health, so it is left for whoever needs it. This **replaces the `WAVE.CLEAR_HEAL` scaffolding**, which healed the party a flat 35% on room clear because nothing in the game could heal at all. There is now a real healing economy and it has to be walked to.
+- **§13's question 4 is now askable.** "Does a single binary upgrade choice feel meaningful, or like a stat point?" has an implementation to judge, including the follow-up: whether breakpoints need to arrive earlier than stack 3.
+- Determinism: stats are a pure function of (class, stacks) and are **recomputed from the class base on every pick, never accumulated in place** — compounding a multiplier into a stored field is a float-drift source, and two peers who took the same upgrades in a different frame order would end up with different damage. Stacks, offers, offer streams and the loot stream are all checksummed.
+- Bots commit to one side of an axis rather than re-deciding per offer. Spreading picks evenly never reaches three stacks, so no bot would ever cross a breakpoint and all seven transformations would have gone untested.
+- Bug found and fixed while building: the bot pressed its signature and its payoff on the same tick, and since Player spends in slot order the signature took 32 of the 100 mana the payoff had just been saved for. A payoff that is only ever unaffordable on the exact tick it becomes affordable never fires at all — Deep Freeze was dead code again, by a different route than last time.
+- Still deferred: an actual boss entity (§11), the shop and score economy (§10), weapon sidegrades (§5), treasure and secret rooms, and the §9 item pool. §4.3's Reforge needs the shop. Balance remains untouched.
 
 **v0.14 — 2026-08-05**
 - **§2 floor generation built.** Seeded room graph — critical path of 8–12 rooms plus 2–3 branches, then a boss arena — with each node populated from a hand-authored template library. Eight Act I templates so far against a target of ~40/act; adding more is content work, not engineering.

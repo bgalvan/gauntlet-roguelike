@@ -19,6 +19,16 @@ export class Projectile extends Entity {
   ownerSlot = -1;
   /** Passes through targets instead of expiring on the first hit. */
   piercing = false;
+  /**
+   * Bodies it may carry into *after* the first, or -1 for unlimited.
+   *
+   * Charged Shot has always pierced without limit; the §4 Pierce
+   * transformation grants a bounded version to basic attacks, which is the
+   * difference between "an upgrade" and "the Archer's whole signature, free".
+   */
+  pierceLimit = -1;
+  /** Damage retained by each body behind the first. */
+  pierceFalloff = 1;
   knockback = 0;
   /** Ticks before it expires on its own. */
   lifeTicks = 0;
@@ -48,7 +58,14 @@ export class Projectile extends Entity {
     speed: number,
     damage: number,
     ownerSlot: number,
-    opts: { piercing?: boolean; knockback?: number; radius?: number; lifeTicks?: number } = {},
+    opts: {
+      piercing?: boolean;
+      pierceLimit?: number;
+      pierceFalloff?: number;
+      knockback?: number;
+      radius?: number;
+      lifeTicks?: number;
+    } = {},
   ): void {
     this.x = x;
     this.y = y;
@@ -59,6 +76,8 @@ export class Projectile extends Entity {
     this.damage_ = damage;
     this.ownerSlot = ownerSlot;
     this.piercing = opts.piercing ?? false;
+    this.pierceLimit = opts.pierceLimit ?? -1;
+    this.pierceFalloff = opts.pierceFalloff ?? 1;
     this.knockback = opts.knockback ?? COMBAT.PROJECTILE_KNOCKBACK;
     this.radius = opts.radius ?? COMBAT.PROJECTILE_RADIUS;
     this.lifeTicks = opts.lifeTicks ?? COMBAT.PROJECTILE_LIFE_TICKS;
@@ -99,6 +118,11 @@ export class Projectile extends Entity {
       return;
     }
     super.writeChecksum(h);
-    h.float(this.vx).float(this.vy).float(this.damage_).int(this.lifeTicks).int(this.hitIds.length);
+    h.float(this.vx)
+      .float(this.vy)
+      .float(this.damage_)
+      .int(this.lifeTicks)
+      .int(this.hitIds.length)
+      .int(this.pierceLimit);
   }
 }

@@ -36,9 +36,27 @@ export interface AbilityContext {
 }
 
 /**
+ * Where an area ability landed, so the caller can mark the ground.
+ *
+ * Returned rather than recomputed by Player: Blast and Volley land on the
+ * current target while Whirlwind and Shockwave land underfoot, and deriving
+ * that a second time at the call site is exactly how a §4 Field ends up
+ * burning somewhere the blast never touched.
+ */
+export interface AbilityImpact {
+  readonly x: number;
+  readonly y: number;
+  readonly radius: number;
+}
+
+/**
  * Execute an ability. `dirX/dirY` is the aim direction — for abilities that
  * need one it is the target override if the player is expressing one, else
  * the facing (§16.5b: abilities are *directional*, never precision-aimed).
+ *
+ * `power` and `radius` come in already scaled by the user's §4 upgrades. The
+ * AbilityDef carries the *authored* values and is never read for them here —
+ * a class's numbers are its base, not its live stats.
  */
 export function executeAbility(
   def: AbilityDef,
@@ -46,27 +64,32 @@ export function executeAbility(
   dirX: number,
   dirY: number,
   ctx: AbilityContext,
-): void {
+  power: number,
+  radius: number,
+): AbilityImpact | null {
   ctx.events.emit(EventKind.Ability, user.x, user.y, {
     ability: def.id,
     slot: user.slot,
     dirX,
     dirY,
-    radius: def.radius,
+    radius,
   });
 
   switch (def.id) {
     // --- Slot 1: traversal ------------------------------------------------
+    // Traversal returns no impact. A field trailing behind every dash would
+    // make the Field breakpoint a movement upgrade, which is a different
+    // design than the one §4.1 describes.
     case AbilityId.Charge:
       // Warrior: a moving hitbox. Damage happens over the dash, not at the end.
-      user.beginDash(dirX, dirY, def.distance, { damage: def.power, radius: def.radius });
-      break;
+      user.beginDash(dirX, dirY, def.distance, { damage: power, radius });
+      return null;
 
     case AbilityId.Dash:
       // Archer: pure repositioning. §3.3 — traversal is always slot 1, but it
       // does not have to carry damage.
       user.beginDash(dirX, dirY, def.distance, {});
-      break;
+      return null;
 
     case AbilityId.Blink:
       // Sorcerer: instant, ignores bodies. The teleport is clamped to the room
@@ -74,33 +97,34 @@ export function executeAbility(
       user.x += dirX * def.distance;
       user.y += dirY * def.distance;
       user.blinkTicks = 8;
-      break;
+      return null;
 
     case AbilityId.Plow:
       // Valkyrie: shoves rather than kills.
       user.beginDash(dirX, dirY, def.distance, {
-        damage: def.power,
-        radius: def.radius,
+        damage: power,
+        radius,
         knockback: 300,
       });
-      break;
+      return null;
 
     // --- Slot 2: signature ------------------------------------------------
     case AbilityId.Whirlwind:
-      damageArea(user, user.x, user.y, def.radius, def.power, ctx, {
+      damageArea(user, user.x, user.y, radius, power, ctx, {
         knockback: 230,
         stagger: COMBAT.HIT_STAGGER_TICKS * 2,
       });
-      break;
+      return { x: user.x, y: user.y, radius };
 
     case AbilityId.ChargedShot:
-      ctx.spawnProjectile(user.x, user.y, dirX, dirY, 780, def.power, user.slot, {
+      ctx.spawnProjectile(user.x, user.y, dirX, dirY, 780, power, user.slot, {
         piercing: true,
         knockback: 260,
-        radius: def.radius,
+        radius,
         lifeTicks: Math.round((def.distance / 780) * SIM.TICK_RATE),
       });
-      break;
+      // A line, not an area — nothing to set alight.
+      return null;
 
     case AbilityId.Blast: {
       // Lands on the current target — the auto-pick, or whoever the override
@@ -109,29 +133,29 @@ export function executeAbility(
       const aimed = user.target;
       const tx = aimed && aimed.alive ? aimed.x : user.x + dirX * def.distance;
       const ty = aimed && aimed.alive ? aimed.y : user.y + dirY * def.distance;
-      damageArea(user, tx, ty, def.radius, def.power, ctx, {
+      damageArea(user, tx, ty, radius, power, ctx, {
         knockback: 240,
         stagger: COMBAT.HIT_STAGGER_TICKS * 3,
       });
-      break;
+      return { x: tx, y: ty, radius };
     }
 
     case AbilityId.Block:
       // Held. The absorbing happens in Player.takeDamage; firing it just
       // marks the state for this tick.
       user.blocking = true;
-      break;
+      return null;
 
     // --- Slot 3: payoff ---------------------------------------------------
     case AbilityId.Shockwave:
       // §3.3: the payoff is "often about the party" and should read loudest.
       // Room-wide stagger is a coordination window, not just damage.
-      damageArea(user, user.x, user.y, def.radius, def.power, ctx, {
+      damageArea(user, user.x, user.y, radius, power, ctx, {
         knockback: 420,
         stagger: COMBAT.HEAVY_STAGGER_TICKS,
         falloff: true,
       });
-      break;
+      return { x: user.x, y: user.y, radius };
 
     case AbilityId.Volley: {
       // A lingering zone rather than an instant hit — arrows rain for a
@@ -143,12 +167,14 @@ export function executeAbility(
       user.beginZone(
         zx,
         zy,
-        def.radius,
-        def.power,
+        radius,
+        power,
         Math.round(3.5 * SIM.TICK_RATE),
         Math.round(0.28 * SIM.TICK_RATE),
       );
-      break;
+      // Volley already *is* a field; stacking a second one on top would
+      // double-dip the breakpoint on the one ability that least needs it.
+      return null;
     }
 
     case AbilityId.Freeze:
@@ -159,7 +185,7 @@ export function executeAbility(
         if (!enemy.alive) continue;
         const dx = enemy.x - user.x;
         const dy = enemy.y - user.y;
-        if (dx * dx + dy * dy > def.radius * def.radius) continue;
+        if (dx * dx + dy * dy > radius * radius) continue;
         enemy.stagger(Math.round(2.6 * SIM.TICK_RATE));
         ctx.events.emit(EventKind.Hit, enemy.x, enemy.y, {
           amount: 0,
@@ -167,11 +193,11 @@ export function executeAbility(
           ability: AbilityId.Freeze,
         });
       }
-      break;
+      return { x: user.x, y: user.y, radius };
 
     case AbilityId.Slam: {
       // Cone knockback plus an ally shield — the party-affecting payoff.
-      damageCone(user, dirX, dirY, def.radius, def.power, ctx, {
+      damageCone(user, dirX, dirY, radius, power, ctx, {
         knockback: 460,
         stagger: COMBAT.HEAVY_STAGGER_TICKS,
       });
@@ -181,8 +207,11 @@ export function executeAbility(
         if (!ally.alive) continue;
         ally.shieldTicks = Math.max(ally.shieldTicks, shieldTicks);
       }
-      break;
+      return { x: user.x, y: user.y, radius };
     }
+
+    default:
+      return null;
   }
 }
 
@@ -290,12 +319,17 @@ export function applyHit(
   if (opts.knockback) enemy.applyKnockback(nx, ny, opts.knockback);
   enemy.stagger(opts.stagger ?? COMBAT.HIT_STAGGER_TICKS);
 
-  ctx.events.emit(wasAlive && !enemy.alive ? EventKind.Kill : EventKind.Hit, enemy.x, enemy.y, {
+  const killed = wasAlive && !enemy.alive;
+  ctx.events.emit(killed ? EventKind.Kill : EventKind.Hit, enemy.x, enemy.y, {
     amount,
     dirX: nx,
     dirY: ny,
     slot: user.slot,
   });
+
+  // §4 Burst. Every kill a player can be credited with passes through here or
+  // through the World's projectile loop, so those are the two places that ask.
+  if (killed) user.onKill(enemy.x, enemy.y, ctx);
 }
 
 /** Enemy contact radius, used by dash sweeps. */

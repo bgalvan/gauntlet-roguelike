@@ -5,8 +5,10 @@ import {
   DOOR,
   LEASH,
   PARTY_SIZE,
+  PICKUP,
   ROOM,
   SIM,
+  UPGRADE,
   WAVE,
 } from '../core/constants';
 import { Rng } from '../core/rng';
@@ -21,6 +23,7 @@ import type { PlayerController, RoomBounds } from './controller';
 import { HumanController } from './controller';
 import { Enemy } from './entities/enemy';
 import type { Entity } from './entities/entity';
+import { Pickup, PickupKind } from './entities/pickup';
 import { Player } from './entities/player';
 import { Projectile } from './entities/projectile';
 import { EventBuffer, EventKind } from './events';
@@ -28,10 +31,17 @@ import { LifeState } from './life-state';
 import { generateFloor, RoomKind } from './rooms/floor';
 import type { Floor, RoomNode } from './rooms/floor';
 import { ALL_DIRECTIONS, Direction, oppositeDirection } from './rooms/templates';
+import { Transformation, rollOffer, tierOf } from './upgrades';
+import type { UpgradeOffer } from './upgrades';
 
 const REVIVE_RANGE_SQ = DEATH.REVIVE_RANGE * DEATH.REVIVE_RANGE;
 const TRANSITION_TICKS = Math.round(DOOR.TRANSITION * SIM.TICK_RATE);
 const LEASH_GRACE_TICKS = Math.round(LEASH.GRACE * SIM.TICK_RATE);
+const AUTO_CONFIRM_TICKS = Math.round(UPGRADE.AUTO_CONFIRM_SECONDS * SIM.TICK_RATE);
+/** Stick deflection that counts as moving the highlight. Well above the
+ *  deadzone the input layer already applies, so a resting stick never drifts
+ *  a player's build. */
+const HIGHLIGHT_THRESHOLD = 0.45;
 
 /** One party member: an entity, whatever drives it, and its input buffer. */
 export interface PartySlot {
@@ -66,6 +76,8 @@ export class World {
   readonly party: PartySlot[] = [];
   readonly enemies: Enemy[] = [];
   readonly projectiles: Projectile[] = [];
+  /** Hearts on the floor (§7.2). Cleared when the party leaves the room. */
+  readonly pickups: Pickup[] = [];
   readonly events = new EventBuffer();
 
   /** The generated floor (§2). Fully reproducible from the seed. */
@@ -87,6 +99,23 @@ export class World {
   floorComplete = false;
 
   roomsCleared = 0;
+
+  // --- §4 upgrades ---------------------------------------------------------
+
+  /** Live offer per slot, or null. Non-null anywhere holds the doors shut. */
+  private readonly offers: (UpgradeOffer | null)[] = [];
+  /** Axis each slot was offered last, so the next draw rotates off it. */
+  private readonly lastOfferAxis: number[] = [];
+  /** Per-slot stream for offers. Forked so that changing how many rolls the
+   *  offer system takes cannot shift floor generation or bot behaviour. */
+  private readonly offerRng: Rng[] = [];
+  /** Picks the party has earned but not yet been shown. */
+  private offersOwed = 0;
+  /** Picks resolved this run. Cheap progress read for the HUD and harness. */
+  upgradesTaken = 0;
+
+  /** Room drops (§7.2). Its own stream for the same reason. */
+  private readonly lootRng: Rng;
 
   /** Ticks left in a door transition; 0 when not transitioning. */
   transitionTicks = 0;
@@ -140,6 +169,7 @@ export class World {
     // stream, so the same seed always produces the same floor regardless of
     // party composition.
     this.floor = generateFloor(this.rng.fork());
+    this.lootRng = this.rng.fork();
     this.currentRoom = this.floor.entryIndex;
 
     const entry = this.room;
@@ -161,6 +191,9 @@ export class World {
 
       this.party.push({ player, controller, input: makeInputState() });
       this.leashTicks.push(0);
+      this.offers.push(null);
+      this.lastOfferAxis.push(-1);
+      this.offerRng.push(this.rng.fork());
     }
 
     this.playerCache = this.party.map((s) => s.player);
@@ -197,6 +230,7 @@ export class World {
       height: this.roomHeight,
       exit,
       botsLead: this.botsLead,
+      pickups: this.pickups,
     };
   }
 
@@ -225,6 +259,33 @@ export class World {
   /** True while the room still has to be fought. Doors stay shut (§2). */
   get inCombat(): boolean {
     return this.enemiesRemaining > 0;
+  }
+
+  /** The offer waiting on a slot, or null. */
+  offerFor(slot: number): UpgradeOffer | null {
+    return this.offers[slot] ?? null;
+  }
+
+  /**
+   * True while anyone still owes the party a pick.
+   *
+   * This holds the doors shut. §4.3 asks for choices to be visible to the
+   * party — "if the Sorcerer commits to AoE, the Warrior can go Reach to
+   * complement" — and that only happens if everyone is looking at the same
+   * moment. Letting the party walk on turns four shared decisions into four
+   * private ones.
+   */
+  get offerPending(): boolean {
+    for (let i = 0; i < this.offers.length; i++) if (this.offers[i]) return true;
+    return false;
+  }
+
+  /** Someone is on the floor bleeding out (§8 stage 1). */
+  get anyDowned(): boolean {
+    for (let i = 0; i < this.playerCache.length; i++) {
+      if (this.playerCache[i]!.life === LifeState.Downed) return true;
+    }
+    return false;
   }
 
   /** How far a slot is outside the leash, 0 when inside. Render uses it for
@@ -281,10 +342,19 @@ export class World {
       );
     }
 
+    // Offers consume the input of any slot they are holding, before that
+    // input can also drive movement or an ability. Constraint #1 still holds:
+    // this reads the abstract InputState, never a key.
+    this.updateOffers();
+
     for (let i = 0; i < this.party.length; i++) {
       const slot = this.party[i]!;
       slot.player.step(dt, slot.input, this.abilityContext);
     }
+
+    // Auras before the enemies act, so a hit landing this tick is reduced by
+    // the shelter that was standing when it landed.
+    this.updateAuras();
 
     this.collectWraiths();
     for (let i = 0; i < this.enemies.length; i++) {
@@ -304,6 +374,7 @@ export class World {
 
     this.updateCentroid();
     this.updateLeash(dt);
+    this.updateLoot();
     this.updateRoomState();
     this.updateDoors();
     this.updateRunState();
@@ -334,6 +405,7 @@ export class World {
     }
 
     this.enemies.length = 0;
+    this.pickups.length = 0;
     for (let i = 0; i < this.projectiles.length; i++) this.projectiles[i]!.retire();
 
     if (!node.cleared && node.template.spawnAnchors.length > 0) {
@@ -431,9 +503,9 @@ export class World {
     }
   }
 
-  /** §2: doors lock during combat. */
+  /** §2: doors lock during combat — and while the party is still choosing. */
   private updateDoors(): void {
-    const open = !this.inCombat;
+    const open = !this.inCombat && !this.offerPending;
     let changed = false;
     for (let i = 0; i < this.doors.length; i++) {
       if (this.doors[i]!.open !== open) changed = true;
@@ -502,8 +574,33 @@ export class World {
     // Room cleared this tick.
     node.cleared = true;
     this.roomsCleared++;
-    this.healOnClear();
+    this.payOutRoom(node);
+    this.offersOwed += UPGRADE.PER_COMBAT_ROOM;
     if (node.kind === RoomKind.Boss) this.floorComplete = true;
+  }
+
+  /**
+   * §2's room-clear reward, and what replaced `WAVE.CLEAR_HEAL`.
+   *
+   * The scaffolding healed the party a flat 35% the instant a room fell,
+   * because nothing in the game could heal and continuous waves guaranteed an
+   * attrition wipe regardless of play. Hearts are the real thing: they land on
+   * the floor, somebody has to walk to them, and whoever is hurt gets them
+   * (§7.3 — a heart is not consumed by a player at full health).
+   */
+  private payOutRoom(node: RoomNode): void {
+    const cx = node.template.width / 2;
+    const cy = node.template.height / 2;
+
+    for (let i = 0; i < PICKUP.CLEAR_HEARTS; i++) {
+      const angle = this.lootRng.range(0, Math.PI * 2);
+      const dist = this.lootRng.range(PICKUP.CLEAR_SCATTER * 0.35, PICKUP.CLEAR_SCATTER);
+      this.spawnPickup(
+        PickupKind.Heart,
+        clamp(cx + Math.cos(angle) * dist, ROOM.WALL + 30, node.template.width - ROOM.WALL - 30),
+        clamp(cy + Math.sin(angle) * dist, ROOM.WALL + 30, node.template.height - ROOM.WALL - 30),
+      );
+    }
   }
 
   /**
@@ -596,6 +693,214 @@ export class World {
     }
   }
 
+  // --- §4 upgrades ---------------------------------------------------------
+
+  /**
+   * Deal and resolve offers.
+   *
+   * Runs after controllers have written their input and before players step,
+   * so a slot holding an offer can consume its own input. Movement is the
+   * highlight and the context action is the commit — no fifth binding, which
+   * is constraint #2 holding even for a menu.
+   */
+  private updateOffers(): void {
+    if (this.offerPending) {
+      this.resolveOffers();
+      return;
+    }
+
+    // Deal only once the room is genuinely settled. Dealing mid-fight would
+    // hand out a build decision during a swarm; dealing over a downed ally
+    // would put the choice and the 3s revive channel on the same button.
+    if (this.offersOwed <= 0) return;
+    if (this.inCombat || this.transitionTicks > 0 || this.anyDowned) return;
+
+    this.dealOffers();
+  }
+
+  private dealOffers(): void {
+    let dealt = false;
+
+    for (let i = 0; i < this.party.length; i++) {
+      const player = this.party[i]!.player;
+      // A Wraith is out of the run (§8 stage 2) — offering them a build
+      // decision they can never spend is worse than offering nothing.
+      if (player.life === LifeState.Wraith) continue;
+
+      const offer = rollOffer(
+        player.def.id,
+        player.stacks,
+        this.offerRng[i]!,
+        this.lastOfferAxis[i] ?? -1,
+      );
+      if (!offer) continue;
+
+      this.offers[i] = offer;
+      this.lastOfferAxis[i] = offer.axisIndex;
+      dealt = true;
+    }
+
+    // Consume the debt either way. A party with every direction capped would
+    // otherwise re-roll nothing on every tick for the rest of the run.
+    this.offersOwed--;
+    if (!dealt) return;
+  }
+
+  private resolveOffers(): void {
+    for (let i = 0; i < this.party.length; i++) {
+      const offer = this.offers[i];
+      if (!offer) continue;
+
+      const slot = this.party[i]!;
+      offer.age++;
+
+      let commit = false;
+
+      if (slot.controller.kind === 'bot') {
+        // A short pause, then a decision — so a party of bots reads as
+        // choosing rather than teleporting through the screen.
+        if (offer.age >= UPGRADE.BOT_DECISION_TICKS) {
+          const pick = slot.controller.chooseUpgrade?.(slot.player, offer.a, offer.b) ?? 0;
+          offer.highlight = pick === 1 ? 1 : 0;
+          commit = true;
+        }
+      } else {
+        const x = slot.input.moveVector.x;
+        if (x <= -HIGHLIGHT_THRESHOLD) offer.highlight = 0;
+        else if (x >= HIGHLIGHT_THRESHOLD) offer.highlight = 1;
+        if (slot.input.contextAction.pressed) commit = true;
+      }
+
+      // The anti-stall net. See UPGRADE.AUTO_CONFIRM_SECONDS — the offer holds
+      // the doors, so it cannot be allowed to hold them forever.
+      if (offer.age >= AUTO_CONFIRM_TICKS) commit = true;
+
+      // Whatever the offer did with this slot's input, the player does not
+      // also get to act on it. Otherwise confirming a pick would fire an
+      // ability, and walking the highlight would walk the body.
+      clearInputState(slot.input);
+
+      if (!commit) continue;
+
+      const index = offer.highlight === 1 ? offer.b : offer.a;
+      const before = tierSnapshot(slot.player);
+      slot.player.applyUpgrade(index);
+      this.offers[i] = null;
+      this.upgradesTaken++;
+
+      this.events.emit(EventKind.Upgrade, slot.player.x, slot.player.y, {
+        slot: slot.player.slot,
+        amount: index,
+      });
+
+      // §4.1's breakpoints are the moment worth announcing — a *new
+      // behaviour*, not a bigger number. Reported as an event so the renderer
+      // can sell it without the simulation knowing what a screen is.
+      const after = tierSnapshot(slot.player);
+      if (after !== before) {
+        this.events.emit(EventKind.Breakpoint, slot.player.x, slot.player.y, {
+          slot: slot.player.slot,
+        });
+      }
+    }
+  }
+
+  /**
+   * §4 Aegis: allies inside a sheltering player's radius take less damage.
+   *
+   * Computed here rather than inside `takeDamage` because damage arrives from
+   * three call sites and none of them holds the party list. The strongest
+   * shelter wins rather than stacking — four Aegis builds multiplying together
+   * would round incoming damage to nothing, and §9.2 warns about exactly this:
+   * any per-player effect is a ×4 party swing.
+   */
+  private updateAuras(): void {
+    for (let i = 0; i < this.playerCache.length; i++) {
+      const target = this.playerCache[i]!;
+      let best = 1;
+
+      for (let j = 0; j < this.playerCache.length; j++) {
+        const source = this.playerCache[j]!;
+        if (source.life !== LifeState.Alive) continue;
+        const tier = tierOf(source.stats, Transformation.Aegis);
+        if (tier === 0) continue;
+
+        // Tier 2 shelters its holder too; tier 1 protects the people standing
+        // with you, which is what makes it a positioning upgrade rather than
+        // a personal one (§9.2: "change positioning, not numbers").
+        if (source.id === target.id && tier < 2) continue;
+
+        const radius = UPGRADE.AEGIS_RADIUS[tier - 1] ?? 0;
+        const dx = source.x - target.x;
+        const dy = source.y - target.y;
+        if (dx * dx + dy * dy > radius * radius) continue;
+
+        const factor = 1 - (UPGRADE.AEGIS_REDUCTION[tier - 1] ?? 0);
+        if (factor < best) best = factor;
+      }
+
+      target.auraDamageFactor = best;
+    }
+  }
+
+  // --- pickups (§7.2) -------------------------------------------------------
+
+  private spawnPickup(kind: PickupKind, x: number, y: number): void {
+    // Bounded: a room that dropped hearts without limit would eventually cost
+    // more to draw than the fight did (constraint #4).
+    if (this.pickups.length >= 24) return;
+    this.pickups.push(new Pickup(this.nextEntityId++, kind, x, y));
+  }
+
+  /**
+   * Roll corpse drops, then hand out anything a player is standing on.
+   *
+   * Free-for-all, touch pickup — §7.2 puts hearts in the tier where "ceremony
+   * here is pure friction". No hold-to-take and no claim window; those exist
+   * for the tiers where an argument is actually possible.
+   */
+  private updateLoot(): void {
+    for (let i = 0; i < this.enemies.length; i++) {
+      const enemy = this.enemies[i]!;
+      if (enemy.alive || enemy.looted) continue;
+      enemy.looted = true;
+      if (this.lootRng.chance(PICKUP.DROP_CHANCE)) {
+        this.spawnPickup(PickupKind.Heart, enemy.x, enemy.y);
+      }
+    }
+
+    for (let i = 0; i < this.pickups.length; i++) {
+      const pickup = this.pickups[i]!;
+      if (pickup.taken) continue;
+
+      for (let j = 0; j < this.playerCache.length; j++) {
+        const p = this.playerCache[j]!;
+        if (p.life !== LifeState.Alive) continue;
+
+        const dx = p.x - pickup.x;
+        const dy = p.y - pickup.y;
+        const reach = PICKUP.REACH + p.radius;
+        if (dx * dx + dy * dy > reach * reach) continue;
+
+        // §7.3: most co-op loot resentment is accidental pickup in a crowded
+        // room — a UX defect, not a design tradeoff. A player at full health
+        // walks over the heart and leaves it for whoever needs it.
+        if (p.maxHp - p.hp < PICKUP.MIN_MISSING_HP) continue;
+
+        const healed = p.heal(p.maxHp * PICKUP.HEART_HEAL);
+        if (healed <= 0) continue;
+
+        pickup.taken = true;
+        pickup.takenBy = p.slot;
+        this.events.emit(EventKind.Pickup, pickup.x, pickup.y, {
+          slot: p.slot,
+          amount: healed,
+        });
+        break;
+      }
+    }
+  }
+
   // --- projectiles / revives / run state ------------------------------------
 
   private stepProjectiles(dt: number): void {
@@ -626,21 +931,34 @@ export class World {
         enemy.applyKnockback(nx, ny, shot.knockback);
         enemy.stagger(COMBAT.HIT_STAGGER_TICKS);
 
-        this.events.emit(
-          wasAlive && !enemy.alive ? EventKind.Kill : EventKind.Hit,
-          enemy.x,
-          enemy.y,
-          { amount: shot.damage_, dirX: nx, dirY: ny, slot: shot.ownerSlot },
-        );
+        const killed = wasAlive && !enemy.alive;
+        this.events.emit(killed ? EventKind.Kill : EventKind.Hit, enemy.x, enemy.y, {
+          amount: shot.damage_,
+          dirX: nx,
+          dirY: ny,
+          slot: shot.ownerSlot,
+        });
 
         const owner = this.party[shot.ownerSlot];
-        if (owner) owner.player.gainOnHit();
+        if (owner) {
+          owner.player.landedHit();
+          if (killed) owner.player.onKill(enemy.x, enemy.y, this.abilityContext);
+        }
 
         if (!shot.piercing) {
           shot.retire();
           break;
         }
+
         shot.hitIds.push(enemy.id);
+        // §4 Pierce is bounded: each body behind the first costs the shot some
+        // damage, and once the allowance is spent the shot stops. Charged Shot
+        // keeps its unlimited pierce by leaving the limit at -1.
+        shot.damage_ *= shot.pierceFalloff;
+        if (shot.pierceLimit >= 0 && shot.hitIds.length > shot.pierceLimit) {
+          shot.retire();
+          break;
+        }
       }
     }
   }
@@ -694,18 +1012,6 @@ export class World {
     }
   }
 
-  /**
-   * Sandbox scaffolding — see WAVE.CLEAR_HEAL. Heals only living players:
-   * healing a Downed player would quietly undo §8's stage 1.
-   */
-  private healOnClear(): void {
-    for (let i = 0; i < this.playerCache.length; i++) {
-      const p = this.playerCache[i]!;
-      if (p.life !== LifeState.Alive) continue;
-      p.hp = Math.min(p.maxHp, p.hp + p.maxHp * WAVE.CLEAR_HEAL);
-    }
-  }
-
   private updateRunState(): void {
     if (this.runOver) return;
     for (let i = 0; i < this.playerCache.length; i++) {
@@ -720,11 +1026,14 @@ export class World {
     const h = new Hasher();
     h.int(this.tick)
       .int(this.rng.getState())
+      .int(this.lootRng.getState())
       .int(this.currentRoom)
       .int(this.transitionTicks)
       .int(this.pendingRoom)
       .int(this.roomsCleared)
       .int(this.arrivedVia ?? -1)
+      .int(this.offersOwed)
+      .int(this.upgradesTaken)
       .bool(this.runOver)
       .bool(this.floorComplete);
 
@@ -743,9 +1052,20 @@ export class World {
       slot.player.writeChecksum(h);
       slot.controller.writeChecksum?.(h);
       h.int(this.leashTicks[i] ?? 0);
+
+      // A live offer holds the doors shut and decides the next pick, and the
+      // offer stream decides which axis is drawn next. Both steer future
+      // behaviour, so both belong here.
+      const offer = this.offers[i];
+      h.int(this.offerRng[i]?.getState() ?? 0)
+        .int(this.lastOfferAxis[i] ?? -1)
+        .int(offer ? offer.axisIndex : -1)
+        .int(offer ? offer.highlight : -1)
+        .int(offer ? offer.age : -1);
     }
     for (let i = 0; i < this.enemies.length; i++) this.enemies[i]!.writeChecksum(h);
     for (let i = 0; i < this.projectiles.length; i++) this.projectiles[i]!.writeChecksum(h);
+    for (let i = 0; i < this.pickups.length; i++) this.pickups[i]!.writeChecksum(h);
     return h.value;
   }
 }
@@ -754,6 +1074,12 @@ export class World {
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** A comparable summary of which §4 transformations a player holds, so a pick
+ *  that crossed a breakpoint can be told from one that only moved a number. */
+function tierSnapshot(player: Player): string {
+  return player.stats.tiers.join(',');
 }
 
 /** Centre of the opening on a given wall. */

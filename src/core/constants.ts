@@ -172,20 +172,128 @@ export const WAVE = {
   PARTY_SCALING: [1.0, 1.65, 2.2, 2.7],
   /** Seconds after a wave is cleared before the next spawns. */
   RESPAWN_DELAY: 3.0,
-
-  /**
-   * Fraction of max HP restored to living players when a wave is cleared.
-   *
-   * SANDBOX SCAFFOLDING, not a design decision. Nothing in the game heals yet
-   * — no pickups, no shop, no items — so continuous waves guarantee a wipe by
-   * attrition regardless of play. Measured: without this the party wipes in
-   * ~46s having cleared one wave. This stands in for §2's room-clear rewards
-   * until those exist, and should be deleted when they do. Real healing
-   * economy is Bobby's call.
-   */
-  CLEAR_HEAL: 0.35,
   /** Enemies spawn at least this far from any player. */
   SAFE_SPAWN_DISTANCE: 260,
+} as const;
+
+/**
+ * Heart pickups — §7.2 tier 1: "Gold, hearts, keys, bombs · free-for-all,
+ * touch pickup · high frequency, low stakes. Ceremony here is pure friction."
+ *
+ * These replace `WAVE.CLEAR_HEAL`, which was sandbox scaffolding standing in
+ * for a healing economy that did not exist. It does now: rooms pay out on
+ * clear, enemies drop on death, and the party has to actually walk to it.
+ */
+export const PICKUP = {
+  RADIUS: 11,
+  /** Body-to-pickup distance that counts as a touch. */
+  REACH: 26,
+  /**
+   * Fraction of the picker's **own** max HP a heart restores. A percentage
+   * rather than a flat value for the same reason DEATH.REVIVE_HP_PERCENT is —
+   * class pools run 82–150 and a flat heal would mean three different things.
+   */
+  HEART_HEAL: 0.22,
+  /** Chance an enemy leaves a heart behind. Rolled on the room's stream. */
+  DROP_CHANCE: 0.08,
+  /** Hearts a cleared combat room pays out regardless of drops. */
+  CLEAR_HEARTS: 2,
+  /** How far from the room centre the clear payout is scattered. */
+  CLEAR_SCATTER: 96,
+  /**
+   * A heart is only consumed by someone actually missing health.
+   *
+   * §7.3 calls accidental pickup in a crowded room the most common source of
+   * co-op loot resentment, and it is a UX defect rather than a design
+   * tradeoff. Walking over a heart at full HP leaves it for whoever needs it.
+   */
+  MIN_MISSING_HP: 1,
+} as const;
+
+/**
+ * Bi-directional upgrades — §4.
+ *
+ * Breakpoints are the load-bearing numbers here: §4.1 calls the 3/6 stack
+ * transformations "the important one", because they are what converts a
+ * repeated binary choice from a slider into a build.
+ */
+export const UPGRADE = {
+  /** Stacks in one direction that grant its first new behaviour. */
+  BREAKPOINT_1: 3,
+  /** Stacks that grant the named capstone (§4.1 fix 3). */
+  BREAKPOINT_2: 6,
+  /** Hard cap per direction — the capstone is the end of the line. */
+  MAX_STACKS: 6,
+
+  /**
+   * Offers per floor, as a cadence.
+   *
+   * §4.3 says "~1 per floor plus 1 per boss · 12–14 choices per run", which
+   * assumes the six-or-so floors of a full run. The prototype has **one**
+   * floor, so that cadence would grant two choices — and a breakpoint at 3
+   * stacks would be literally unreachable, leaving §13's question 4 ("does a
+   * single binary upgrade choice feel meaningful, or like a stat point?")
+   * unanswerable, along with the follow-up about whether breakpoints need to
+   * arrive earlier.
+   *
+   * So the prototype pays out on every cleared combat room. That is roughly
+   * 9–12 choices on one floor: enough to reach stack 3–6 and actually see a
+   * transformation fire. SANDBOX TUNING — restore the §4.3 cadence when there
+   * is more than one floor to spend it over. Flagged for Bobby.
+   */
+  PER_COMBAT_ROOM: 1,
+
+  /** Ticks a bot spends "deciding", so the party reads as choosing together. */
+  BOT_DECISION_TICKS: 24,
+
+  /**
+   * Seconds before an unanswered offer takes whatever is highlighted.
+   *
+   * The offer holds the doors shut so the party chooses together (§4.3 wants
+   * the picks visible to each other), and anything that holds the doors shut
+   * needs an escape hatch — otherwise one player stepping away from the
+   * keyboard ends the run for four people. §7.2 reaches for the same device
+   * for shared loot: a claim window that is *skippable*.
+   */
+  AUTO_CONFIRM_SECONDS: 8,
+
+  // --- transformation tuning ------------------------------------------------
+
+  /** Cleave: arc half-angle and damage share at tier 1; tier 2 is the full
+   *  circle, so only the damage share is listed. */
+  CLEAVE_HALF_ANGLE: Math.PI / 3,
+  CLEAVE_SHARE: [0.55, 0.8],
+  /** Cleave, projectile flavour: extra shots either side, and their spread. */
+  CLEAVE_EXTRA_SHOTS: [1, 2],
+  CLEAVE_SPREAD: 0.16,
+
+  /** Pierce: extra bodies a basic attack carries into. -1 is unlimited. */
+  PIERCE_BODIES: [1, -1],
+  /** Damage retained by each body behind the first. */
+  PIERCE_FALLOFF: 0.7,
+
+  /** Field: fraction of the ability's radius and power, and seconds it burns. */
+  FIELD_RADIUS_SHARE: [0.6, 0.85],
+  FIELD_POWER_SHARE: [0.18, 0.3],
+  FIELD_SECONDS: [2.5, 4.5],
+  FIELD_INTERVAL: 0.3,
+
+  /** Burst: radius and damage of a corpse detonation. */
+  BURST_RADIUS: [86, 132],
+  BURST_POWER: [9, 18],
+
+  /** Surge: ticks shaved off every ability cooldown per landed hit. */
+  SURGE_TICKS: [3, 7],
+
+  /** Aegis: radius of the shelter, and the damage it removes. */
+  AEGIS_RADIUS: [150, 230],
+  AEGIS_REDUCTION: [0.12, 0.25],
+
+  /** Stance: bonus damage while the positional condition holds. */
+  STANCE_BONUS: [0.12, 0.26],
+  /** Ticks of stillness before the "stationary" flavour counts. Without a
+   *  delay the bonus flickers on every frame a stick returns to centre. */
+  STANCE_SETTLE_TICKS: 18,
 } as const;
 
 /**

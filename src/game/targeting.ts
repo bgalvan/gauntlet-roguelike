@@ -9,14 +9,14 @@ import type { Entity } from './entities/entity';
  * *direction*. It is a tactical choice, not a precision test — which is what
  * makes a mouse, a stick and (later) a thumb equally expressive.
  */
-export function selectTarget(
+export function selectTarget<T extends Entity>(
   source: Entity,
-  candidates: readonly Entity[],
+  candidates: readonly T[],
   overrideActive: boolean,
   overrideX: number,
   overrideY: number,
   maxRangeSq: number,
-): Entity | null {
+): T | null {
   if (overrideActive) {
     const picked = pickByDirection(source, candidates, overrideX, overrideY);
     // An override outside attack range still *holds* the selection — the
@@ -26,12 +26,12 @@ export function selectTarget(
   return pickNearest(source, candidates, maxRangeSq);
 }
 
-function pickNearest(
+function pickNearest<T extends Entity>(
   source: Entity,
-  candidates: readonly Entity[],
+  candidates: readonly T[],
   maxRangeSq: number,
-): Entity | null {
-  let best: Entity | null = null;
+): T | null {
+  let best: T | null = null;
   let bestDistSq = Infinity;
 
   // Indexed loop over an array: deterministic order, and the id tie-break
@@ -51,14 +51,14 @@ function pickNearest(
   return best;
 }
 
-function pickByDirection(
+function pickByDirection<T extends Entity>(
   source: Entity,
-  candidates: readonly Entity[],
+  candidates: readonly T[],
   dirX: number,
   dirY: number,
-): Entity | null {
+): T | null {
   const minDot = Math.cos(TARGETING.OVERRIDE_HALF_ANGLE);
-  let best: Entity | null = null;
+  let best: T | null = null;
   let bestDot = -Infinity;
   let bestDistSq = Infinity;
 

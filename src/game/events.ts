@@ -20,6 +20,12 @@ export const EventKind = {
   Downed: 'downed',
   Revived: 'revived',
   Blocked: 'blocked',
+  /** A heart was taken (§7.2). */
+  Pickup: 'pickup',
+  /** An upgrade direction was chosen (§4). */
+  Upgrade: 'upgrade',
+  /** A direction reached a breakpoint and handed over a behaviour (§4.1). */
+  Breakpoint: 'breakpoint',
 } as const;
 
 export type EventKind = (typeof EventKind)[keyof typeof EventKind];
