@@ -21,6 +21,19 @@ function classTexture(id: ClassId): string {
   }
 }
 
+function classGlowTexture(id: ClassId): string {
+  switch (id) {
+    case ClassId.Warrior:
+      return 'glow-warrior';
+    case ClassId.Archer:
+      return 'glow-archer';
+    case ClassId.Sorcerer:
+      return 'glow-sorcerer';
+    case ClassId.Valkyrie:
+      return 'glow-valkyrie';
+  }
+}
+
 /**
  * Class select.
  *
@@ -40,6 +53,7 @@ export class SelectScene extends Phaser.Scene {
   private hint!: Phaser.GameObjects.Text;
   private readonly cardTexts: Phaser.GameObjects.Text[] = [];
   private readonly cardSprites: Phaser.GameObjects.Image[] = [];
+  private readonly cardGlows: Phaser.GameObjects.Image[] = [];
 
   private selected = 0;
   /** Debounce for stick/key repeat — held left does not scroll at 60Hz. */
@@ -72,6 +86,8 @@ export class SelectScene extends Phaser.Scene {
         fontSize: '44px',
         fontStyle: 'bold',
         color: '#ffd700',
+        stroke: '#2a1a08',
+        strokeThickness: 7,
       })
       .setOrigin(0.5);
 
@@ -85,7 +101,13 @@ export class SelectScene extends Phaser.Scene {
       .setOrigin(0.5);
 
     for (let i = 0; i < CLASS_ORDER.length; i++) {
-      const sprite = this.add.image(0, 0, classTexture(CLASS_ORDER[i]!)).setDisplaySize(72, 72);
+      const glow = this.add
+        .image(0, 0, classGlowTexture(CLASS_ORDER[i]!))
+        .setDisplaySize(160, 160)
+        .setBlendMode(Phaser.BlendModes.ADD);
+      this.cardGlows.push(glow);
+
+      const sprite = this.add.image(0, 0, classTexture(CLASS_ORDER[i]!)).setDisplaySize(84, 84);
       this.cardSprites.push(sprite);
 
       const text = this.add
@@ -238,6 +260,9 @@ export class SelectScene extends Phaser.Scene {
       // Pixel-art portrait, gently bobbing when selected so it reads as alive
       // rather than a static card — the arcade cabinet's idle animation.
       const bob = active ? Math.sin(this.elapsed * 4) * 3 : 0;
+      const glow = this.cardGlows[i]!;
+      glow.setPosition(x + w / 2, y + SILHOUETTE_DY + bob);
+      glow.setAlpha(active ? 0.75 + 0.2 * Math.sin(this.elapsed * 3) : 0.15);
       const sprite = this.cardSprites[i]!;
       sprite.setPosition(x + w / 2, y + SILHOUETTE_DY + bob);
       sprite.setAlpha(active ? 1 : 0.55);
