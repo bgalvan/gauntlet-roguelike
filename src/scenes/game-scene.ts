@@ -83,10 +83,13 @@ export class GameScene extends Phaser.Scene {
   private floorTiles!: Phaser.GameObjects.TileSprite;
   private wallTiles: Phaser.GameObjects.TileSprite[] = [];
   private readonly torches: Phaser.GameObjects.Image[] = [];
+  private readonly torchGlows: Phaser.GameObjects.Image[] = [];
   private roomBuiltFor = -1;
   private readonly playerSprites: Phaser.GameObjects.Image[] = [];
+  private readonly playerGlows: Phaser.GameObjects.Image[] = [];
   private readonly enemySprites: Phaser.GameObjects.Image[] = [];
   private readonly boltSprites: Phaser.GameObjects.Image[] = [];
+  private vignette!: Phaser.GameObjects.Image;
 
   private hud!: Phaser.GameObjects.Text;
   private banner!: Phaser.GameObjects.Text;
@@ -148,6 +151,14 @@ export class GameScene extends Phaser.Scene {
       worldObjects.push(s);
     }
     for (let i = 0; i < PARTY_SIZE; i++) {
+      // A soft additive glow pool under each hero — the "fake lighting" that
+      // makes the party itself read as a light source, per the warm/alive
+      // ambience pass. Sits just under the sprite, above the floor and walls.
+      const glow = this.add.image(0, 0, 'glow-white').setDepth(6.5).setVisible(false).setBlendMode(Phaser.BlendModes.ADD);
+      this.playerGlows.push(glow);
+      worldObjects.push(glow);
+    }
+    for (let i = 0; i < PARTY_SIZE; i++) {
       const s = this.add.image(0, 0, 'char-warrior').setDepth(7).setVisible(false);
       this.playerSprites.push(s);
       worldObjects.push(s);
@@ -155,6 +166,12 @@ export class GameScene extends Phaser.Scene {
 
     this.hudGfx = this.add.graphics().setDepth(20);
     hudObjects.push(this.hudGfx);
+
+    // Screen-space vignette: framing, not a world object, so it rides the HUD
+    // camera and needs no world coordinates (constraint #5 stays intact —
+    // nothing here is a hardcoded world position).
+    this.vignette = this.add.image(VIEW.WIDTH / 2, VIEW.HEIGHT / 2, 'fx-vignette').setDepth(19);
+    hudObjects.push(this.vignette);
 
     for (let i = 0; i < PARTY_SIZE; i++) {
       const dot = this.add.image(0, 0, 'nameplate').setDepth(21).setDisplaySize(26, 22);
@@ -333,8 +350,9 @@ export class GameScene extends Phaser.Scene {
       switch (e.kind) {
         case EventKind.Hit: {
           const color = e.slot >= 0 ? this.slotColor(e.slot) : 0xffd9a0;
-          this.particles.burst(e.x, e.y, e.dirX, e.dirY, 5, { color, speed: 210 });
+          this.particles.burst(e.x, e.y, e.dirX, e.dirY, 7, { color, speed: 230, size: 4 });
           if (e.amount > 0) {
+            this.particles.flash(e.x, e.y, 9);
             this.spawnDamageNumber(e.x, e.y, Math.round(e.amount), color);
             this.addShake(0.7);
             audio.hit();
@@ -344,8 +362,10 @@ export class GameScene extends Phaser.Scene {
 
         case EventKind.Kill: {
           const color = e.slot >= 0 ? this.slotColor(e.slot) : 0xffffff;
-          this.particles.ring(e.x, e.y, 14, { color: 0xff9a7a, speed: 240, life: 0.5 });
-          this.particles.burst(e.x, e.y, e.dirX, e.dirY, 8, { color, speed: 300 });
+          this.particles.flash(e.x, e.y, 20, 0.16);
+          this.particles.ring(e.x, e.y, 18, { color: 0xff9a7a, speed: 260, life: 0.55 });
+          this.particles.shockRing(e.x, e.y, 34, color, 0.4);
+          this.particles.burst(e.x, e.y, e.dirX, e.dirY, 11, { color, speed: 320, size: 5 });
           if (e.amount > 0) this.spawnDamageNumber(e.x, e.y, Math.round(e.amount), color);
           this.addShake(2.4);
           audio.kill();
@@ -394,7 +414,10 @@ export class GameScene extends Phaser.Scene {
         this.particles.ring(p.x, p.y, 24, { color: 0x6fd08c, speed: 220, life: 0.8 });
         audio.revived();
       }
-      if (p.isDashing) this.particles.trail(p.x, p.y, this.slotColor(p.slot), 5, 0.3);
+      if (p.isDashing) {
+        this.particles.trail(p.x, p.y, this.slotColor(p.slot), 7, 0.32);
+        this.particles.trail(p.x, p.y, 0xffffff, 3, 0.18);
+      }
       if (p.attackedThisTick && p.def.attackStyle === 'projectile') audio.shoot();
     }
 
@@ -497,6 +520,10 @@ export class GameScene extends Phaser.Scene {
   private updateTorches(): void {
     const key = Math.floor(this.time.now / 180) % 2 === 0 ? 'torch-0' : 'torch-1';
     for (const t of this.torches) t.setTexture(key);
+    // Gentle flicker on the glow pools, independent of the flame-frame swap,
+    // so the light pool itself feels alive rather than a static decal.
+    const flicker = 0.82 + 0.18 * Math.sin(this.time.now * 0.006) + 0.06 * Math.sin(this.time.now * 0.023);
+    for (const g of this.torchGlows) g.setAlpha(flicker);
   }
 
   private drawEnemies(g: Phaser.GameObjects.Graphics, alpha: number): void {
@@ -512,7 +539,7 @@ export class GameScene extends Phaser.Scene {
       const y = lerp(enemy.prevY, enemy.y, alpha);
       sprite.setVisible(true).setPosition(x, y);
       sprite.setFlipX(enemy.facingX < 0);
-      sprite.setDisplaySize(enemy.radius * 2.4, enemy.radius * 2.4);
+      sprite.setDisplaySize(enemy.radius * 2.7, enemy.radius * 2.7);
       const frozen = enemy.staggerTicks > COMBAT.HIT_STAGGER_TICKS * 2;
       sprite.setTint(enemy.hitFlashTicks > 0 ? 0xffffff : frozen ? 0xa8d8ff : 0xffffff);
       sprite.setAlpha(1);
@@ -578,6 +605,8 @@ export class GameScene extends Phaser.Scene {
     this.wallTiles.length = 0;
     for (const t of this.torches) t.destroy();
     this.torches.length = 0;
+    for (const t of this.torchGlows) t.destroy();
+    this.torchGlows.length = 0;
 
     const addWall = (x: number, y: number, ww: number, hh: number): void => {
       const t = this.add.tileSprite(x, y, ww, hh, 'tile-wall').setOrigin(0, 0).setDepth(0.5);
@@ -596,13 +625,23 @@ export class GameScene extends Phaser.Scene {
       [w - ROOM.WALL * 0.3, h / 2],
     ];
     for (const [tx, ty] of midpoints) {
+      // The glow pool sits under the torch sprite, additively blended, so the
+      // flame reads as the centre of a warm pool of light rather than a lit
+      // sprite floating in the dark — pre-rendered, so it costs one extra
+      // draw call per torch, not a real-time light.
+      const glow = this.add
+        .image(tx, ty + 10, 'glow-torch')
+        .setDepth(1.8)
+        .setDisplaySize(260, 260)
+        .setBlendMode(Phaser.BlendModes.ADD);
+      this.torchGlows.push(glow);
       const torch = this.add.image(tx, ty, 'torch-0').setDepth(2);
       this.torches.push(torch);
     }
 
     // New per-room objects must be excluded from the HUD camera, like
     // everything else in the world layer.
-    this.hudCamera.ignore([...this.wallTiles, ...this.torches]);
+    this.hudCamera.ignore([...this.wallTiles, ...this.torches, ...this.torchGlows]);
   }
 
   /**
@@ -652,20 +691,32 @@ export class GameScene extends Phaser.Scene {
     const def = player.def;
     const isLocal = !player.botControlled;
     const sprite = this.playerSprites[player.slot]!;
+    const glow = this.playerGlows[player.slot]!;
     sprite.setVisible(true).setPosition(x, y);
     sprite.setTexture(classTexture(def.id));
     sprite.setFlipX(player.facingX < 0);
-    sprite.setDisplaySize(player.radius * 2.6, player.radius * 2.6);
+    // Chunkier-than-literal proportions — a touch larger than the collision
+    // radius reads as "alive and present" rather than a precise hitbox.
+    sprite.setDisplaySize(player.radius * 2.9, player.radius * 2.9);
     sprite.setRotation(0);
 
     if (player.life === LifeState.Wraith) {
       sprite.setAlpha(0.22).setTint(def.color);
+      glow.setVisible(false);
       g.lineStyle(1, def.rim, 0.14).strokeCircle(x, y, DEATH.WRAITH_SLOW_RADIUS);
       return;
     }
 
+    glow
+      .setVisible(true)
+      .setPosition(x, y + player.radius * 0.3)
+      .setDisplaySize(player.radius * 4.2, player.radius * 4.2)
+      .setTint(def.color)
+      .setAlpha(0.4);
+
     if (player.life === LifeState.Downed) {
       sprite.setAlpha(0.65).setTint(0xff9a9a).setRotation(Math.PI / 2);
+      glow.setAlpha(0.18);
       this.drawBar(g, x, y - player.radius - 15, 46, player.bleedOutRemaining, 0xff6b6b);
       if (player.reviveProgress > 0) {
         this.drawBar(g, x, y - player.radius - 24, 46, player.reviveProgress, 0x6fd08c);
@@ -829,7 +880,14 @@ export class GameScene extends Phaser.Scene {
       const ready = cd <= 0 && affordable;
 
       g.fillStyle(0x0e1219, 0.92).fillRoundedRect(x, slotY, slotSize, slotSize, 7);
-      g.lineStyle(ready ? 2.5 : 1.5, ready ? def.rim : 0x2b3242, 1);
+      if (ready) {
+        // A slow pulse on the outline of a ready slot — chunky arcade UI
+        // should tell you "press me" without a tooltip.
+        const pulse = 0.65 + 0.35 * Math.sin(this.time.now * 0.006 + i);
+        g.lineStyle(4, def.rim, pulse * 0.4);
+        g.strokeRoundedRect(x - 2, slotY - 2, slotSize + 4, slotSize + 4, 9);
+      }
+      g.lineStyle(ready ? 3 : 1.5, ready ? def.rim : 0x2b3242, 1);
       g.strokeRoundedRect(x, slotY, slotSize, slotSize, 7);
 
       if (cd > 0) {
