@@ -1,12 +1,25 @@
 import Phaser from 'phaser';
 
 import { VIEW } from '../core/constants';
-import { CLASS_ORDER, getClass } from '../game/classes';
+import { ClassId, CLASS_ORDER, getClass } from '../game/classes';
 import { GamepadBackend } from '../input/backends/gamepad';
 import { KeyboardMouseBackend } from '../input/backends/keyboard-mouse';
 import { InputManager } from '../input/input-manager';
 import { audio } from '../render/audio';
-import { drawSilhouette } from '../render/silhouette';
+import { buildRetroTextures } from '../render/pixelart';
+
+function classTexture(id: ClassId): string {
+  switch (id) {
+    case ClassId.Warrior:
+      return 'char-warrior';
+    case ClassId.Archer:
+      return 'char-archer';
+    case ClassId.Sorcerer:
+      return 'char-sorcerer';
+    case ClassId.Valkyrie:
+      return 'char-valkyrie';
+  }
+}
 
 /**
  * Class select.
@@ -26,6 +39,7 @@ export class SelectScene extends Phaser.Scene {
   private title!: Phaser.GameObjects.Text;
   private hint!: Phaser.GameObjects.Text;
   private readonly cardTexts: Phaser.GameObjects.Text[] = [];
+  private readonly cardSprites: Phaser.GameObjects.Image[] = [];
 
   private selected = 0;
   /** Debounce for stick/key repeat — held left does not scroll at 60Hz. */
@@ -38,11 +52,14 @@ export class SelectScene extends Phaser.Scene {
   }
 
   create(): void {
+    buildRetroTextures(this);
+
     this.selected = 0;
     this.confirmed = false;
     this.navCooldown = 0;
     this.elapsed = 0;
     this.cardTexts.length = 0;
+    this.cardSprites.length = 0;
 
     this.kbm = new KeyboardMouseBackend(this.game.canvas, () => null);
     this.input$ = new InputManager().add(this.kbm).add(new GamepadBackend());
@@ -50,26 +67,32 @@ export class SelectScene extends Phaser.Scene {
     this.gfx = this.add.graphics();
 
     this.title = this.add
-      .text(VIEW.WIDTH / 2, 40, 'CHOOSE YOUR CLASS', {
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        fontSize: '32px',
-        color: '#e8edf6',
+      .text(VIEW.WIDTH / 2, 36, 'GAUNTLET', {
+        fontFamily: 'Courier New, monospace',
+        fontSize: '44px',
+        fontStyle: 'bold',
+        color: '#ffd700',
       })
       .setOrigin(0.5);
 
     this.add
-      .text(VIEW.WIDTH / 2, 72, 'Three allies will join you. They take the other three roles.', {
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      .text(VIEW.WIDTH / 2, 76, 'CHOOSE YOUR CHARACTER — three allies take the other roles', {
+        fontFamily: 'Courier New, monospace',
         fontSize: '13px',
-        color: '#6c7a91',
+        fontStyle: 'bold',
+        color: '#c7a85a',
       })
       .setOrigin(0.5);
 
     for (let i = 0; i < CLASS_ORDER.length; i++) {
+      const sprite = this.add.image(0, 0, classTexture(CLASS_ORDER[i]!)).setDisplaySize(72, 72);
+      this.cardSprites.push(sprite);
+
       const text = this.add
         .text(0, 0, '', {
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontFamily: 'Courier New, monospace',
           fontSize: '11px',
+          fontStyle: 'bold',
           color: '#c3ccdb',
           lineSpacing: 2,
           align: 'left',
@@ -195,7 +218,7 @@ export class SelectScene extends Phaser.Scene {
     const g = this.gfx;
     g.clear();
 
-    g.fillStyle(0x0f1218, 1).fillRect(0, 0, VIEW.WIDTH, VIEW.HEIGHT);
+    g.fillStyle(0x100b07, 1).fillRect(0, 0, VIEW.WIDTH, VIEW.HEIGHT);
 
     for (let i = 0; i < CLASS_ORDER.length; i++) {
       const def = getClass(CLASS_ORDER[i]!);
@@ -205,26 +228,20 @@ export class SelectScene extends Phaser.Scene {
       const h = this.cardHeight;
       const active = i === this.selected;
 
-      g.fillStyle(active ? 0x1d2431 : 0x161a22, 1);
-      g.fillRoundedRect(x, y, w, h, 10);
-      g.lineStyle(active ? 3 : 1.5, active ? def.rim : 0x2b3242, 1);
-      g.strokeRoundedRect(x, y, w, h, 10);
+      // Stone-slab card, gold-rimmed when selected — same material language
+      // as the dungeon itself.
+      g.fillStyle(active ? 0x3a2f20 : 0x201a12, 1);
+      g.fillRect(x, y, w, h);
+      g.lineStyle(active ? 3 : 1.5, active ? 0xffd700 : 0x4a3826, 1);
+      g.strokeRect(x, y, w, h);
 
-      // Silhouette preview, slowly rotating so the shape reads in motion —
-      // which is how it will actually be seen (Pillar 1).
-      const spin = active ? this.elapsed * 1.1 : 0.6;
-      drawSilhouette(
-        g,
-        def.silhouette,
-        x + w / 2,
-        y + SILHOUETTE_DY,
-        active ? 28 : 23,
-        Math.cos(spin),
-        Math.sin(spin),
-        def.color,
-        def.rim,
-        active ? 1 : 0.65,
-      );
+      // Pixel-art portrait, gently bobbing when selected so it reads as alive
+      // rather than a static card — the arcade cabinet's idle animation.
+      const bob = active ? Math.sin(this.elapsed * 4) * 3 : 0;
+      const sprite = this.cardSprites[i]!;
+      sprite.setPosition(x + w / 2, y + SILHOUETTE_DY + bob);
+      sprite.setAlpha(active ? 1 : 0.55);
+      sprite.setTint(active ? 0xffffff : 0x9a8a70);
 
       this.drawStatBars(g, def, x + 16, y + STATS_DY, w - 32, active);
 
