@@ -120,6 +120,26 @@ export class Particles {
     p.active = true;
   }
 
+  /**
+   * A bright, short-lived flash at the point of impact, layered under a hit
+   * burst. Vampire-Survivors-style hits read as punchy mostly because of this
+   * one extra white frame — the coloured sparks alone look soft.
+   */
+  flash(x: number, y: number, size = 10, life = 0.12): void {
+    const p = this.next();
+    p.x = x;
+    p.y = y;
+    p.vx = 0;
+    p.vy = 0;
+    p.maxLife = life;
+    p.life = life;
+    p.size = size;
+    p.color = 0xffffff;
+    p.shape = ParticleShape.Dot;
+    p.drag = 1;
+    p.active = true;
+  }
+
   /** Soft trail dot — dashes, projectiles. */
   trail(x: number, y: number, color: number, size = 4, life = 0.28): void {
     const p = this.next();
