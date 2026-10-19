@@ -1,5 +1,5 @@
 # DESIGN MANUAL — Untitled Co-op Roguelike
-**Version 0.14 · Last updated 2026-08-05**
+**Version 0.15 · Last updated 2026-10-19**
 
 > **STATUS: CANONICAL.** This document supersedes `coop-roguelike-spec.md` (v0.1) and `coop-roguelike-loot-and-party-items.md`. Both are archived; their content is folded in below. This is the single source of truth.
 
@@ -667,6 +667,11 @@ Ranked by actual impact:
 ---
 
 ## 18. CHANGELOG
+
+**v0.15 — 2026-10-19**
+- **Visual rebuild toward the 1985 Gauntlet aesthetic.** `src/render/` presentation layer and both scenes rebuilt: procedural pixel-art textures (`src/render/pixelart.ts`) generated at runtime — no art pipeline, no downloaded assets — for dungeon brick walls, floor tiles, flickering torches, barred/open doors, a frontal pixel sprite per class (reusing the existing §3.1/Pillar-1 silhouette shape language so the identity survives the restyle), a ghoul enemy sprite, and a bolt projectile sprite. Scenes now compose these as pooled `Phaser.GameObjects.Image`s positioned every frame from sim state, rather than vector silhouettes drawn fresh each frame.
+- Added classic-cabinet UI touches: stone nameplates with class-colour tags, and optional "X NEEDS FOOD BADLY" flavour text when a living player drops below 25% HP.
+- **Simulation layer untouched.** `src/core/` and `src/game/` — fixed timestep, seeded PRNG, input abstraction, floor generation, classes/abilities, collision, death/revive, bot controllers — are the same validated architecture the determinism harness (`test/determinism.ts`, 25 checks) exercises; none of hard constraints #1–#9 in `CLAUDE.md` changed, and all 25 checks still pass unmodified. A from-scratch rewrite of that layer was judged not worth the determinism risk for a task whose actual ask was the visual identity; see the PR description for the full scoping rationale.
 
 **v0.14 — 2026-08-05**
 - **§2 floor generation built.** Seeded room graph — critical path of 8–12 rooms plus 2–3 branches, then a boss arena — with each node populated from a hand-authored template library. Eight Act I templates so far against a target of ~40/act; adding more is content work, not engineering.
