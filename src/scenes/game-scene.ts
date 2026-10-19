@@ -354,7 +354,11 @@ export class GameScene extends Phaser.Scene {
           if (e.amount > 0) {
             this.particles.flash(e.x, e.y, 9);
             this.spawnDamageNumber(e.x, e.y, Math.round(e.amount), color);
-            this.addShake(0.7);
+            // Basic hits are the most frequent event in the game — with four
+            // players in a real fight this fires many times a second, so it
+            // gets the smallest possible nudge. Shake is reserved for kills,
+            // payoffs and the player's own damage taken.
+            this.addShake(0.12);
             audio.hit();
           }
           break;
@@ -367,7 +371,7 @@ export class GameScene extends Phaser.Scene {
           this.particles.shockRing(e.x, e.y, 34, color, 0.4);
           this.particles.burst(e.x, e.y, e.dirX, e.dirY, 11, { color, speed: 320, size: 5 });
           if (e.amount > 0) this.spawnDamageNumber(e.x, e.y, Math.round(e.amount), color);
-          this.addShake(2.4);
+          this.addShake(1);
           audio.kill();
           break;
         }
@@ -381,7 +385,10 @@ export class GameScene extends Phaser.Scene {
             speed: isPayoff ? 320 : 190,
             life: isPayoff ? 0.6 : 0.38,
           });
-          this.addShake(isPayoff ? 7 : 1.6);
+          // Payoff abilities (slot 3 — Shockwave, Volley, Deep Freeze, Shield
+          // Slam) are the rare, earned hits; they keep a real punch. Everyday
+          // signatures and traversal only get a light tap.
+          this.addShake(isPayoff ? 3.2 : 0.5);
           if (isPayoff) audio.payoff();
           else audio.ability();
           break;
@@ -398,7 +405,7 @@ export class GameScene extends Phaser.Scene {
     const local = this.world.localPlayer;
     if (local.hp < this.lastLocalHp) {
       this.hurtFlash = Math.min(1, this.hurtFlash + 0.55);
-      this.addShake(3);
+      this.addShake(1.4);
       audio.hurt();
     }
     this.lastLocalHp = local.hp;
@@ -407,7 +414,7 @@ export class GameScene extends Phaser.Scene {
       const p = slot.player;
       if (p.downedThisTick) {
         this.particles.ring(p.x, p.y, 20, { color: 0xff6b6b, speed: 150, life: 0.7 });
-        this.addShake(6);
+        this.addShake(3.5);
         audio.downed();
       }
       if (p.revivedThisTick) {
@@ -426,8 +433,14 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // Lowered from 16: with four players fighting at once, basic hits alone
+  // used to stack the old per-hit amounts to the cap almost continuously,
+  // turning "a hit landed" into a constant background rumble. A lower cap
+  // plus faster decay keeps shake reserved for moments that earn it.
+  private static readonly SHAKE_CAP = 6;
+
   private addShake(amount: number): void {
-    this.shake = Math.min(16, this.shake + amount);
+    this.shake = Math.min(GameScene.SHAKE_CAP, this.shake + amount);
   }
 
   private updateShake(dt: number): void {
@@ -437,7 +450,8 @@ export class GameScene extends Phaser.Scene {
       this.shakeY = 0;
       return;
     }
-    this.shake *= Math.pow(0.0016, dt);
+    // Decays to ~1% in ~0.12s — a snappy jolt, not a lingering wobble.
+    this.shake *= Math.pow(0.0001, dt);
     const angle = this.time.now * 0.05;
     this.shakeX = Math.cos(angle * 1.7) * this.shake;
     this.shakeY = Math.sin(angle * 2.3) * this.shake;
